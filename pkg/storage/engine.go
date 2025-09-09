@@ -455,7 +455,11 @@ type IterOptions struct {
 	// is minimized if the probability of the key existing is not low or if
 	// this is a one-time Seek (where loading the data block directly is better).
 	useL6Filters bool
+
+	MaximumSuffixProperty MaximumSuffixProperty
 }
+
+type MaximumSuffixProperty = pebble.MaximumSuffixProperty
 
 // IterKeyType configures which types of keys an iterator should surface.
 //

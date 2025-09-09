@@ -46,6 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/cockroachkvs"
 )
 
 const (
@@ -1496,9 +1497,10 @@ func MVCCGetWithValueHeader(
 	iter, err := newMVCCIterator(
 		ctx, reader, timestamp, false /* rangeKeyMasking */, opts.DontInterleaveIntents,
 		IterOptions{
-			KeyTypes:     IterKeyTypePointsAndRanges,
-			Prefix:       true,
-			ReadCategory: opts.ReadCategory,
+			KeyTypes:              IterKeyTypePointsAndRanges,
+			Prefix:                true,
+			ReadCategory:          opts.ReadCategory,
+			MaximumSuffixProperty: cockroachkvs.MaxMVCCTimestampProperty{},
 		},
 	)
 	if err != nil {
