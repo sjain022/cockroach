@@ -227,6 +227,7 @@ func (p *pebbleIterator) setOptions(
 		KeyTypes:                  opts.KeyTypes,
 		UseL6Filters:              opts.useL6Filters,
 		Category:                  opts.ReadCategory.PebbleCategory(),
+		MaximumSuffixProperty:     opts.MaximumSuffixProperty,
 	}
 	p.prefix = opts.Prefix
 
