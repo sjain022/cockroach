@@ -11,6 +11,7 @@ import (
 	"iter"
 	"math/rand"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -1332,6 +1333,13 @@ func (cf *changeFrontier) Start(ctx context.Context) {
 	// TODO(yevgeniy): Figure out how to inject replication stream metrics.
 	cf.metrics = cf.FlowCtx.Cfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics)
 
+	// Cluster level metric
+	execCfg := cf.FlowCtx.Cfg.ExecutorConfig.(*sql.ExecutorConfig)
+	if execCfg.ClusterMetricsWriter != nil {
+		execCfg.ClusterMetricsWriter.AddMetric(clusterCheckpointLag)
+
+	}
+
 	// Pass a nil oracle because this sink is only used to emit resolved timestamps
 	// but the oracle is only used when emitting row updates.
 	var nilOracle timestampLowerBoundOracle
@@ -1741,6 +1749,8 @@ func (cf *changeFrontier) maybeCheckpoint(
 	// checkpoint_progress metric which will return the lowest timestamp across
 	// all feeds in the scope.
 	cf.sliMetrics.setCheckpoint(cf.sliMetricsID, newResolved)
+	jobIDStr := strconv.FormatInt(int64(cf.spec.JobID), 10)
+	clusterCheckpointLag.SetStartTime(map[string]string{"job_id": jobIDStr})
 
 	return cf.maybeEmitResolved(ctx, newResolved)
 }

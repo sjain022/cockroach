@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/timers"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
+	"github.com/cockroachdb/cockroach/pkg/obs/clustermetrics/cmmetrics"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -871,6 +872,14 @@ var (
 		Unit:        metric.Unit_COUNT,
 		Category:    metric.Metadata_CHANGEFEEDS,
 	}
+	// probably fine to keep this here for now .
+	metaCheckPointLagMetric = metric.Metadata{
+		Name:        "changefeed.checkpoint_lag",
+		Help:        "Elapsed time sine the last persisted checkpoint, per changefeed job",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
+		Category:    metric.Metadata_CHANGEFEEDS,
+	}
 )
 
 func newAggregateMetrics(histogramWindow time.Duration, lookup *cidr.Lookup) *AggMetrics {
@@ -1498,6 +1507,26 @@ type Metrics struct {
 	}
 }
 
+// Cluter metrics are the new metrics introduced for cluster wide
+type ClusterMetrics struct {
+	myClusterCheckpointLag *cmmetrics.WriteStopwatchVec
+}
+
+func (*ClusterMetrics) MetricStruct() {}
+
+var clusterCheckpointLag = cmmetrics.NewWriteStopwatchVec(
+	metaCheckPointLagMetric, timeutil.DefaultTimeSource{}, "job_id",
+)
+
+// The writer is interface that exists in the exec.Cfg I can not really use this
+// func NewClusterMetrics(writer *cmwriter.Writer) metric.Struct {
+// 	ret := &ClusterMetrics{
+// 		myClusterCheckpointLag: clustermetrics.NewWriteStopwatchVec(metaCheckPointLagMetric, timeutil.DefaultTimeSource{}, "job_id"),
+// 	}
+// 	writer.AddMetricStruct(ret)
+// 	return ret
+// }
+
 // MetricStruct implements the metric.Struct interface.
 func (*Metrics) MetricStruct() {}
 
@@ -1585,4 +1614,6 @@ func MakeMemoryMetrics(
 func init() {
 	jobs.MakeChangefeedMetricsHook = MakeMetrics
 	jobs.MakeChangefeedMemoryMetricsHook = MakeMemoryMetrics
+	//apparently not needed ? I need to read more on this later
+	// clustermetrics.RegisterClusterMetric(metaCheckPointLagMetric.Name, metaCheckPointLagMetric)
 }

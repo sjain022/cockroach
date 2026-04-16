@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/backup/backupresolver"
@@ -2105,6 +2106,9 @@ func (b *changefeedResumer) OnFailOrCancel(
 			ptsID,
 		)
 	}
+	// Not sure this is the write place to clean up the cluster metric
+	jobIDStr := strconv.FormatInt(int64(b.job.ID()), 10)
+	clusterCheckpointLag.Delete(map[string]string{"job_id": jobIDStr})
 
 	maybeCleanUpProtectedTimestamp(progress.GetChangefeed().ProtectedTimestampRecord)
 	// We clean up the per-table protected timestamps (and their accompanying
