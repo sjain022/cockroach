@@ -447,11 +447,10 @@ func TestCorruptManifestRejected(t *testing.T) {
 	require.Contains(t, sawErr.Error(), "CRC32C mismatch")
 }
 
-// TestFramingFormat pins the on-disk framing format down: a
-// manifest written by WriteTickManifest is a 4-byte little-endian
-// uint32 of CRC32C(payload) XOR FramingMagic, followed by the
-// marshaled proto.
-func TestFramingFormat(t *testing.T) {
+// TestCRC32Format pins the leading-checksum format down: a manifest
+// written by WriteTickManifest is a 4-byte little-endian CRC32C of
+// the marshaled proto, followed by the marshaled proto.
+func TestCRC32Format(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 	tempDir := t.TempDir()
@@ -468,9 +467,8 @@ func TestFramingFormat(t *testing.T) {
 
 	buf, err := os.ReadFile(filepath.Join(tempDir, revlog.MarkerPath(te)))
 	require.NoError(t, err)
-	require.Greater(t, len(buf), revlog.FramingPrefixLen)
-	stored := binary.LittleEndian.Uint32(buf[:revlog.FramingPrefixLen])
-	want := stored ^ revlog.FramingMagic
-	got := crc32.Checksum(buf[revlog.FramingPrefixLen:], crc32.MakeTable(crc32.Castagnoli))
+	require.Greater(t, len(buf), 4)
+	want := binary.LittleEndian.Uint32(buf[:4])
+	got := crc32.Checksum(buf[4:], crc32.MakeTable(crc32.Castagnoli))
 	require.Equal(t, got, want)
 }

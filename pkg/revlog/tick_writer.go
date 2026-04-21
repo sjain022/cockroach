@@ -7,6 +7,8 @@ package revlog
 
 import (
 	"context"
+	"encoding/binary"
+	"hash/crc32"
 
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/revlog/revlogpb"
@@ -17,6 +19,10 @@ import (
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
 )
+
+// crc32cTable is the Castagnoli polynomial table used for the trailing
+// checksum of manifest objects.
+var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
 // TickWriter writes one data file in a tick. It opens an SSTable
 // stream into external storage at log/data/<tick-end>/<file_id>.sst
@@ -109,10 +115,10 @@ func (w *TickWriter) Close() (revlogpb.File, revlogpb.Stats, error) {
 }
 
 // WriteTickManifest writes (and seals) the close marker for one tick.
-// The on-disk layout is the framing defined in framing.go (a
-// 4-byte little-endian uint32 of CRC32C(payload) XOR FramingMagic,
-// followed by the marshaled Manifest proto), so readers verify
-// with a single GET — no separate Size() call to locate a trailer.
+// The marker layout on disk is a 4-byte little-endian CRC32C of the
+// marshaled body, followed by the marshaled Manifest proto. The
+// leading-checksum layout lets readers verify with a single GET — no
+// separate Size() call to locate a trailer.
 //
 // The manifest's TickStart and TickEnd must both be set, defining
 // the tick's coverage as (TickStart, TickEnd]. Files must be the
@@ -137,15 +143,21 @@ func WriteTickManifest(
 	if err != nil {
 		return errors.Wrap(err, "marshaling manifest")
 	}
+	var header [4]byte
+	binary.LittleEndian.PutUint32(header[:], crc32.Checksum(body, crc32cTable))
 
 	name := MarkerPath(manifest.TickEnd)
 	wc, err := es.Writer(ctx, name)
 	if err != nil {
 		return errors.Wrapf(err, "opening marker %s", name)
 	}
-	if _, err := wc.Write(EncodeFramed(body)); err != nil {
+	if _, err := wc.Write(header[:]); err != nil {
 		_ = wc.Close()
-		return errors.Wrap(err, "writing manifest")
+		return errors.Wrap(err, "writing manifest header")
+	}
+	if _, err := wc.Write(body); err != nil {
+		_ = wc.Close()
+		return errors.Wrap(err, "writing manifest body")
 	}
 	return wc.Close()
 }

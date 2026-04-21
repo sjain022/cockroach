@@ -8,6 +8,8 @@ package revlog
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"hash/crc32"
 	"iter"
 	"slices"
 	"strings"
@@ -340,9 +342,9 @@ func (tr *TickReader) emitFile(
 	return nil
 }
 
-// readManifest downloads, verifies, and decodes a tick manifest
-// at the given object name. The on-disk layout is the framing
-// defined in framing.go.
+// readManifest downloads, verifies, and decodes a tick manifest at
+// the given object name. The marker layout is a 4-byte little-endian
+// CRC32C followed by the marshaled Manifest proto.
 func readManifest(
 	ctx context.Context, es cloud.ExternalStorage, name string,
 ) (revlogpb.Manifest, error) {
@@ -355,9 +357,13 @@ func readManifest(
 	if err != nil {
 		return revlogpb.Manifest{}, errors.Wrapf(err, "reading %s", name)
 	}
-	body, err := DecodeFramed(buf)
-	if err != nil {
-		return revlogpb.Manifest{}, errors.Wrapf(err, "manifest %s", name)
+	if len(buf) < 4 {
+		return revlogpb.Manifest{}, errors.Errorf("manifest %s too short: %d bytes", name, len(buf))
+	}
+	want := binary.LittleEndian.Uint32(buf[:4])
+	body := buf[4:]
+	if got := crc32.Checksum(body, crc32cTable); got != want {
+		return revlogpb.Manifest{}, errors.Errorf("manifest %s CRC32C mismatch: want %x, got %x", name, want, got)
 	}
 	var m revlogpb.Manifest
 	if err := protoutil.Unmarshal(body, &m); err != nil {
