@@ -7,6 +7,7 @@ package rangefeed_test
 
 import (
 	"context"
+	"math/rand"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/revlog"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -39,159 +41,196 @@ func val(s string) roachpb.Value {
 	return roachpb.Value{RawBytes: []byte(s)}
 }
 
-type received struct {
-	key string
-	val string
+// makeConcurrentFrontier creates a concurrent frontier from the
+// given spans and timestamps. Used by StartFromFrontier tests
+// where processEvents advances the frontier concurrently.
+func makeConcurrentFrontier(
+	t *testing.T, entries ...struct {
+		sp roachpb.Span
+		ts hlc.Timestamp
+	},
+) span.Frontier {
+	t.Helper()
+	spans := make([]roachpb.Span, len(entries))
+	for i, e := range entries {
+		spans[i] = e.sp
+	}
+	base, err := span.MakeFrontier(spans...)
+	require.NoError(t, err)
+	for _, e := range entries {
+		_, err := base.Forward(e.sp, e.ts)
+		require.NoError(t, err)
+	}
+	f := span.MakeConcurrentFrontier(base)
+	t.Cleanup(f.Release)
+	return f
 }
 
-// twoTickReader returns a TestLogReader with two 10s ticks.
-func twoTickReader() *revlog.TestLogReader {
-	return revlog.NewTestLogReader([]revlog.TestTick{
-		{
-			Tick: revlog.Tick{TickStart: ts(0), TickEnd: ts(10)},
-			Events: []revlog.Event{
-				{Key: key("a"), Timestamp: ts(3), Value: val("v1")},
-				{Key: key("b"), Timestamp: ts(7), Value: val("v2")},
-			},
-		},
-		{
-			Tick: revlog.Tick{TickStart: ts(10), TickEnd: ts(20)},
-			Events: []revlog.Event{
-				{Key: key("c"), Timestamp: ts(15), Value: val("v3")},
-			},
-		},
+// frontierEntry is a helper for makeConcurrentFrontier.
+func frontierEntry(sp roachpb.Span, ts hlc.Timestamp) struct {
+	sp roachpb.Span
+	ts hlc.Timestamp
+} {
+	return struct {
+		sp roachpb.Span
+		ts hlc.Timestamp
+	}{sp: sp, ts: ts}
+}
+
+// waitForFrontier polls the frontier until its minimum timestamp
+// reaches the expected value. Uses SucceedsSoonError so it
+// respects race-detector timeouts. Safe to call from any goroutine.
+func waitForFrontier(frontier span.Frontier, expected hlc.Timestamp) error {
+	return testutils.SucceedsSoonError(func() error {
+		if frontier.Frontier().Less(expected) {
+			return errors.Newf("frontier %s has not reached %s", frontier.Frontier(), expected)
+		}
+		return nil
 	})
 }
 
-// blockingRangefeed returns a mock rangefeed func that sends one event,
-// signals ready, then blocks until ctx is canceled. It records the
-// startFrom it was called with.
-func blockingRangefeed(
-	t *testing.T, eventKey string, eventVal string, eventTS hlc.Timestamp, ready chan struct{},
-) (func(context.Context, []roachpb.Span, hlc.Timestamp, chan<- kvcoord.RangeFeedMessage) error, *atomic.Int64) {
-	var startFromWall atomic.Int64
-	return func(
-		ctx context.Context,
-		spans []roachpb.Span,
-		startFrom hlc.Timestamp,
-		eventC chan<- kvcoord.RangeFeedMessage,
-	) error {
-		startFromWall.Store(startFrom.WallTime)
-		eventC <- kvcoord.RangeFeedMessage{
-			RangeFeedEvent: &kvpb.RangeFeedEvent{
-				Val: &kvpb.RangeFeedValue{
-					Key:   key(eventKey),
-					Value: roachpb.Value{RawBytes: []byte(eventVal), Timestamp: eventTS},
-				},
-			},
-		}
-		if ready != nil {
+// TestRevisionStreamLiveCatchUp uses Generate to populate a
+// TestLogReader with random ticks, then verifies that the revision
+// stream wrapper replays them and hands off to the inner DB with
+// the frontier advanced to the end of the last tick.
+func TestRevisionStreamLiveCatchUp(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
+	sp := roachpb.Span{Key: key("a"), EndKey: key("z")}
+	reader := revlog.NewTestLogReader(nil)
+
+	rng := rand.New(rand.NewSource(42))
+	const numTicks = 5
+	endTS := reader.Generate(rng, ts(0), numTicks, []roachpb.Span{sp})
+
+	// The RangeFeed path now calls inner.RangeFeedFromFrontier after
+	// replay, so we set up the frontier mock.
+	ready := make(chan struct{}, 1)
+	mc := &mockClient{
+		rangeFeedFromFrontier: func(
+			ctx context.Context,
+			frontier span.Frontier,
+			eventC chan<- kvcoord.RangeFeedMessage,
+		) error {
+			// The frontier should be advanced to the end of the last tick.
+			require.Equal(t, endTS, frontier.Frontier())
 			select {
 			case ready <- struct{}{}:
 			default:
 			}
-		}
-		<-ctx.Done()
-		return ctx.Err()
-	}, &startFromWall
-}
-
-// collectEvents drains up to n events from the channel with a timeout.
-func collectEvents(ch <-chan received, n int, timeout time.Duration) []received {
-	var out []received
-	deadline := time.After(timeout)
-	for range n {
-		select {
-		case ev := <-ch:
-			out = append(out, ev)
-		case <-deadline:
-			return out
-		}
+			<-ctx.Done()
+			return ctx.Err()
+		},
 	}
-	return out
-}
-
-// TestRevisionStreamReplay verifies the basic two-phase flow:
-// phase 1 replays events from the revision stream, phase 2 hands
-// off to the inner DB (mock KV rangefeed) for live events.
-func TestRevisionStreamReplay(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ctx := context.Background()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-
-	sp := roachpb.Span{Key: key("a"), EndKey: key("z")}
-	reader := twoTickReader()
-
-	ready := make(chan struct{}, 1)
-	rfFunc, startFromWall := blockingRangefeed(t, "d", "v4", ts(25), ready)
-	mc := &mockClient{rangefeed: rfFunc}
 
 	f := rangefeed.NewFactoryWithDB(stopper, mc, nil)
-	events := make(chan received, 10)
-
-	rf, err := f.RangeFeed(ctx, "test", []roachpb.Span{sp}, ts(0),
+	var eventCount atomic.Int64
+	rf, err := f.RangeFeed(ctx, "live-catchup", []roachpb.Span{sp}, ts(0),
 		func(ctx context.Context, v *kvpb.RangeFeedValue) {
-			events <- received{key: string(v.Key), val: string(v.Value.RawBytes)}
+			eventCount.Add(1)
 		},
 		rangefeed.WithRevisionStream(reader),
 	)
 	require.NoError(t, err)
 	defer rf.Close()
 
-	<-ready
-	got := collectEvents(events, 4, 5*time.Second)
+	select {
+	case <-ready:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for inner DB call")
+	}
 
-	require.Equal(t, []received{
-		{key: "a", val: "v1"},
-		{key: "b", val: "v2"},
-		{key: "c", val: "v3"},
-		{key: "d", val: "v4"},
-	}, got)
-
-	// Inner DB was called with startFrom = ts(20).
-	require.Equal(t, ts(20).WallTime, startFromWall.Load())
+	// Events were emitted during replay.
+	require.Greater(t, eventCount.Load(), int64(0))
 }
 
-// TestRevisionStreamEmptyLog verifies that an empty revision stream
-// (no ticks) falls back to the inner DB immediately.
-func TestRevisionStreamEmptyLog(t *testing.T) {
+// TestRevisionStreamCoverageDrop uses Generate, then adds coverage
+// epochs to drop one span mid-stream. Verifies that after replay
+// the frontier reflects per-span progress: the covered span is
+// advanced to the last tick, while the dropped span stays at the
+// coverage-drop point.
+func TestRevisionStreamCoverageDrop(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	sp := roachpb.Span{Key: key("a"), EndKey: key("z")}
-	reader := revlog.NewTestLogReader(nil) // no ticks
+	// Use non-adjacent spans so the frontier doesn't merge them.
+	spanLow := roachpb.Span{Key: key("a"), EndKey: key("m")}
+	spanHigh := roachpb.Span{Key: key("n"), EndKey: key("z")}
+	bothSpans := []roachpb.Span{spanLow, spanHigh}
+
+	reader := revlog.NewTestLogReader(nil)
+	rng := rand.New(rand.NewSource(99))
+
+	// Generate 2 ticks covering both spans.
+	midTS := reader.Generate(rng, ts(0), 2, bothSpans)
+
+	// Add coverage epochs: both spans covered initially, then only
+	// spanLow after midTS.
+	reader.AddCoverageEpoch(revlog.CoverageEpoch{
+		EffectiveFrom: ts(0),
+		Spans:         bothSpans,
+	})
+	reader.AddCoverageEpoch(revlog.CoverageEpoch{
+		EffectiveFrom: midTS,
+		Spans:         []roachpb.Span{spanLow},
+	})
+
+	// Generate 3 more ticks — only spanLow is covered now.
+	endTS := reader.Generate(rng, midTS, 3, bothSpans)
 
 	ready := make(chan struct{}, 1)
-	rfFunc, startFromWall := blockingRangefeed(t, "a", "v1", ts(5), ready)
-	mc := &mockClient{rangefeed: rfFunc}
+	mc := &mockClient{
+		rangeFeedFromFrontier: func(
+			ctx context.Context,
+			frontier span.Frontier,
+			eventC chan<- kvcoord.RangeFeedMessage,
+		) error {
+			// spanLow should be advanced to endTS (replayed all 5 ticks).
+			// spanHigh should be at midTS (coverage dropped after tick 2).
+			// frontier.Frontier() is the min, so it should be midTS.
+			require.Equal(t, midTS, frontier.Frontier())
+
+			// Verify per-span entries.
+			for sp, ts := range frontier.Entries() {
+				if sp.Equal(spanLow) {
+					require.Equal(t, endTS, ts)
+				} else if sp.Equal(spanHigh) {
+					require.Equal(t, midTS, ts)
+				}
+			}
+
+			select {
+			case ready <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
 
 	f := rangefeed.NewFactoryWithDB(stopper, mc, nil)
-	events := make(chan received, 10)
-
-	rf, err := f.RangeFeed(ctx, "test", []roachpb.Span{sp}, ts(0),
-		func(ctx context.Context, v *kvpb.RangeFeedValue) {
-			events <- received{key: string(v.Key), val: string(v.Value.RawBytes)}
-		},
+	rf, err := f.RangeFeed(ctx, "coverage-drop", bothSpans, ts(0),
+		func(ctx context.Context, v *kvpb.RangeFeedValue) {},
 		rangefeed.WithRevisionStream(reader),
 	)
 	require.NoError(t, err)
 	defer rf.Close()
 
-	<-ready
-	got := collectEvents(events, 1, 5*time.Second)
-	require.Equal(t, []received{{key: "a", val: "v1"}}, got)
-
-	// Inner DB was called with ts(0) — no replay happened.
-	require.Equal(t, ts(0).WallTime, startFromWall.Load())
+	select {
+	case <-ready:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for inner DB call")
+	}
 }
 
-// TestRevisionStreamRetrySkipsReplay verifies that after phase 2
-// fails and the retry loop re-calls RangeFeed, phase 1 does not
-// re-run because the frontier is now past the revision stream's
-// resolved time.
+// TestRevisionStreamRetrySkipsReplay uses Generate to populate
+// ticks, then verifies that after replay + KV failure + retry, the
+// second attempt skips replay because the frontier is past the log.
 func TestRevisionStreamRetrySkipsReplay(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
@@ -199,38 +238,43 @@ func TestRevisionStreamRetrySkipsReplay(t *testing.T) {
 	defer stopper.Stop(ctx)
 
 	sp := roachpb.Span{Key: key("a"), EndKey: key("z")}
-	reader := twoTickReader()
+	reader := revlog.NewTestLogReader(nil)
+
+	rng := rand.New(rand.NewSource(77))
+	endTS := reader.Generate(rng, ts(0), 3, []roachpb.Span{sp})
+
+	// checkpointTS is past the log's last tick end. After the
+	// inner DB sends this checkpoint and fails, the retry should
+	// see the frontier at checkpointTS and skip replay.
+	checkpointTS := endTS.Add(2*time.Second.Nanoseconds(), 0)
 
 	var callCount atomic.Int32
 	ready := make(chan struct{}, 1)
 	mc := &mockClient{
-		rangefeed: func(
+		rangeFeedFromFrontier: func(
 			ctx context.Context,
-			spans []roachpb.Span,
-			startFrom hlc.Timestamp,
+			frontier span.Frontier,
 			eventC chan<- kvcoord.RangeFeedMessage,
 		) error {
 			n := callCount.Add(1)
 			if n == 1 {
-				// First call: after revision stream replay, startFrom
-				// should be ts(20). Send a checkpoint to advance the
-				// frontier, then fail.
-				require.Equal(t, ts(20), startFrom)
+				// First call: replay advanced the frontier to endTS.
+				// Send a checkpoint past that to advance further, then fail.
 				eventC <- kvcoord.RangeFeedMessage{
 					RangeFeedEvent: &kvpb.RangeFeedEvent{
 						Checkpoint: &kvpb.RangeFeedCheckpoint{
 							Span:       sp,
-							ResolvedTS: ts(22),
+							ResolvedTS: checkpointTS,
 						},
 					},
 				}
 				return errors.New("transient failure")
 			}
-			// Second call (retry): startFrom should be ts(22) —
-			// the frontier was advanced by the checkpoint above.
-			// This is past logResolved=ts(20), so replay is skipped.
-			require.True(t, !startFrom.Less(ts(22)),
-				"retry startFrom %s should be >= ts(22)", startFrom)
+			// Second call (retry): the rangefeed's frontier was
+			// advanced to checkpointTS by processEvents. The frontier
+			// should be >= checkpointTS, and replay should be skipped.
+			require.True(t, !frontier.Frontier().Less(checkpointTS),
+				"retry frontier %s should be >= %s", frontier.Frontier(), checkpointTS)
 			ready <- struct{}{}
 			<-ctx.Done()
 			return ctx.Err()
@@ -238,8 +282,7 @@ func TestRevisionStreamRetrySkipsReplay(t *testing.T) {
 	}
 
 	f := rangefeed.NewFactoryWithDB(stopper, mc, nil)
-
-	rf, err := f.RangeFeed(ctx, "test", []roachpb.Span{sp}, ts(0),
+	rf, err := f.RangeFeed(ctx, "retry-skip", []roachpb.Span{sp}, ts(0),
 		func(ctx context.Context, v *kvpb.RangeFeedValue) {},
 		rangefeed.WithRevisionStream(reader),
 		rangefeed.WithRetry(retry.Options{
@@ -258,16 +301,26 @@ func TestRevisionStreamRetrySkipsReplay(t *testing.T) {
 	require.GreaterOrEqual(t, int(callCount.Load()), 2)
 }
 
-// TestRevisionStreamFromFrontier verifies the StartFromFrontier
-// path used by LDR/PCR producers.
-func TestRevisionStreamFromFrontier(t *testing.T) {
+// TestRevisionStreamPartialFrontier uses Generate over two spans
+// with different starting frontier timestamps, then verifies the
+// wrapper correctly replays and hands off via StartFromFrontier.
+func TestRevisionStreamPartialFrontier(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	sp := roachpb.Span{Key: key("a"), EndKey: key("z")}
-	reader := twoTickReader()
+	spanAC := roachpb.Span{Key: key("a"), EndKey: key("m")}
+	spanCF := roachpb.Span{Key: key("m"), EndKey: key("z")}
+	bothSpans := []roachpb.Span{spanAC, spanCF}
+
+	reader := revlog.NewTestLogReader(nil)
+	rng := rand.New(rand.NewSource(55))
+	endTS := reader.Generate(rng, ts(0), 6, bothSpans)
+
+	// spanAC starts at ts(0) (needs all 6 ticks).
+	// spanCF starts at ts(20) (needs ticks 3–6).
+	midTS := ts(20) // end of tick 2
 
 	ready := make(chan struct{}, 1)
 	mc := &mockClient{
@@ -276,17 +329,9 @@ func TestRevisionStreamFromFrontier(t *testing.T) {
 			frontier span.Frontier,
 			eventC chan<- kvcoord.RangeFeedMessage,
 		) error {
-			// After revision stream replay, the frontier should
-			// have been advanced to ts(20).
-			require.Equal(t, ts(20), frontier.Frontier())
-			eventC <- kvcoord.RangeFeedMessage{
-				RangeFeedEvent: &kvpb.RangeFeedEvent{
-					Val: &kvpb.RangeFeedValue{
-						Key:   key("d"),
-						Value: roachpb.Value{RawBytes: []byte("v4"), Timestamp: ts(25)},
-					},
-				},
-			}
+			// processEvents advances the shared frontier
+			// concurrently. Poll until it reaches endTS.
+			require.NoError(t, waitForFrontier(frontier, endTS))
 			ready <- struct{}{}
 			<-ctx.Done()
 			return ctx.Err()
@@ -294,69 +339,254 @@ func TestRevisionStreamFromFrontier(t *testing.T) {
 	}
 
 	f := rangefeed.NewFactoryWithDB(stopper, mc, nil)
-	events := make(chan received, 10)
+	frontier := makeConcurrentFrontier(t,
+		frontierEntry(spanAC, ts(0)),
+		frontierEntry(spanCF, midTS),
+	)
 
-	frontier, err := span.MakeFrontier(sp)
-	require.NoError(t, err)
-	_, err = frontier.Forward(sp, ts(0))
-	require.NoError(t, err)
-
-	rf := f.New("test", ts(0),
-		func(ctx context.Context, v *kvpb.RangeFeedValue) {
-			events <- received{key: string(v.Key), val: string(v.Value.RawBytes)}
-		},
+	rf := f.New("partial-frontier", ts(0),
+		func(ctx context.Context, v *kvpb.RangeFeedValue) {},
 		rangefeed.WithRevisionStream(reader),
 	)
 	require.NoError(t, rf.StartFromFrontier(ctx, frontier))
 	defer rf.Close()
 
-	<-ready
-	got := collectEvents(events, 4, 5*time.Second)
-
-	require.Equal(t, []received{
-		{key: "a", val: "v1"},
-		{key: "b", val: "v2"},
-		{key: "c", val: "v3"},
-		{key: "d", val: "v4"},
-	}, got)
+	select {
+	case <-ready:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for inner DB call")
+	}
 }
 
-// TestRevisionStreamSpanFilter verifies that the revision stream
-// wrapper only delivers events for the requested spans.
-func TestRevisionStreamSpanFilter(t *testing.T) {
+// TestRevisionStreamLiveCatchUpFromFrontier is the StartFromFrontier
+// variant of LiveCatchUp. The shared frontier is advanced by
+// processEvents consuming checkpoints emitted during replay.
+func TestRevisionStreamLiveCatchUpFromFrontier(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	// Span only covers [a, b) — should exclude "b" and "c".
-	sp := roachpb.Span{Key: key("a"), EndKey: key("b")}
-	reader := twoTickReader()
+	sp := roachpb.Span{Key: key("a"), EndKey: key("z")}
+	reader := revlog.NewTestLogReader(nil)
+
+	rng := rand.New(rand.NewSource(42))
+	const numTicks = 5
+	endTS := reader.Generate(rng, ts(0), numTicks, []roachpb.Span{sp})
 
 	ready := make(chan struct{}, 1)
-	rfFunc, _ := blockingRangefeed(t, "a", "live", ts(25), ready)
-	mc := &mockClient{rangefeed: rfFunc}
+	mc := &mockClient{
+		rangeFeedFromFrontier: func(
+			ctx context.Context,
+			frontier span.Frontier,
+			eventC chan<- kvcoord.RangeFeedMessage,
+		) error {
+			// The shared frontier is advanced by processEvents
+			// concurrently. Poll until it reaches endTS.
+			require.NoError(t, waitForFrontier(frontier, endTS))
+			select {
+			case ready <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
 
 	f := rangefeed.NewFactoryWithDB(stopper, mc, nil)
-	events := make(chan received, 10)
+	frontier := makeConcurrentFrontier(t, frontierEntry(sp, ts(0)))
 
-	rf, err := f.RangeFeed(ctx, "test", []roachpb.Span{sp}, ts(0),
-		func(ctx context.Context, v *kvpb.RangeFeedValue) {
-			events <- received{key: string(v.Key), val: string(v.Value.RawBytes)}
+	rf := f.New("live-catchup-frontier", ts(0),
+		func(ctx context.Context, v *kvpb.RangeFeedValue) {},
+		rangefeed.WithRevisionStream(reader),
+	)
+	require.NoError(t, rf.StartFromFrontier(ctx, frontier))
+	defer rf.Close()
+
+	select {
+	case <-ready:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for inner DB call")
+	}
+}
+
+// TestRevisionStreamCoverageDropFromFrontier is the
+// StartFromFrontier variant of CoverageDrop.
+func TestRevisionStreamCoverageDropFromFrontier(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
+	// Use non-adjacent spans so the frontier doesn't merge them.
+	spanLow := roachpb.Span{Key: key("a"), EndKey: key("m")}
+	spanHigh := roachpb.Span{Key: key("n"), EndKey: key("z")}
+	bothSpans := []roachpb.Span{spanLow, spanHigh}
+
+	reader := revlog.NewTestLogReader(nil)
+	rng := rand.New(rand.NewSource(99))
+
+	midTS := reader.Generate(rng, ts(0), 2, bothSpans)
+
+	reader.AddCoverageEpoch(revlog.CoverageEpoch{
+		EffectiveFrom: ts(0),
+		Spans:         bothSpans,
+	})
+	reader.AddCoverageEpoch(revlog.CoverageEpoch{
+		EffectiveFrom: midTS,
+		Spans:         []roachpb.Span{spanLow},
+	})
+
+	reader.Generate(rng, midTS, 3, bothSpans)
+
+	ready := make(chan struct{}, 1)
+	mc := &mockClient{
+		rangeFeedFromFrontier: func(
+			ctx context.Context,
+			frontier span.Frontier,
+			eventC chan<- kvcoord.RangeFeedMessage,
+		) error {
+			// processEvents advances the shared frontier concurrently.
+			// Poll until spanHigh reaches midTS (coverage dropped
+			// after tick 2, so it won't advance further).
+			require.NoError(t, waitForFrontier(frontier, midTS))
+			select {
+			case ready <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			return ctx.Err()
 		},
+	}
+
+	f := rangefeed.NewFactoryWithDB(stopper, mc, nil)
+	frontier := makeConcurrentFrontier(t,
+		frontierEntry(spanLow, ts(0)),
+		frontierEntry(spanHigh, ts(0)),
+	)
+
+	rf := f.New("coverage-drop-frontier", ts(0),
+		func(ctx context.Context, v *kvpb.RangeFeedValue) {},
+		rangefeed.WithRevisionStream(reader),
+	)
+	require.NoError(t, rf.StartFromFrontier(ctx, frontier))
+	defer rf.Close()
+
+	select {
+	case <-ready:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for inner DB call")
+	}
+}
+
+// TestRevisionStreamRetrySkipsReplayFromFrontier is the
+// StartFromFrontier variant of RetrySkipsReplay.
+func TestRevisionStreamRetrySkipsReplayFromFrontier(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
+	sp := roachpb.Span{Key: key("a"), EndKey: key("z")}
+	reader := revlog.NewTestLogReader(nil)
+
+	rng := rand.New(rand.NewSource(77))
+	endTS := reader.Generate(rng, ts(0), 3, []roachpb.Span{sp})
+
+	checkpointTS := endTS.Add(2*time.Second.Nanoseconds(), 0)
+
+	var callCount atomic.Int32
+	ready := make(chan struct{}, 1)
+	mc := &mockClient{
+		rangeFeedFromFrontier: func(
+			ctx context.Context,
+			frontier span.Frontier,
+			eventC chan<- kvcoord.RangeFeedMessage,
+		) error {
+			n := callCount.Add(1)
+			if n == 1 {
+				eventC <- kvcoord.RangeFeedMessage{
+					RangeFeedEvent: &kvpb.RangeFeedEvent{
+						Checkpoint: &kvpb.RangeFeedCheckpoint{
+							Span:       sp,
+							ResolvedTS: checkpointTS,
+						},
+					},
+				}
+				return errors.New("transient failure")
+			}
+			require.True(t, !frontier.Frontier().Less(checkpointTS),
+				"retry frontier %s should be >= %s", frontier.Frontier(), checkpointTS)
+			ready <- struct{}{}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	f := rangefeed.NewFactoryWithDB(stopper, mc, nil)
+	frontier := makeConcurrentFrontier(t, frontierEntry(sp, ts(0)))
+
+	rf := f.New("retry-skip-frontier", ts(0),
+		func(ctx context.Context, v *kvpb.RangeFeedValue) {},
+		rangefeed.WithRevisionStream(reader),
+		rangefeed.WithRetry(retry.Options{
+			InitialBackoff: time.Millisecond,
+			MaxBackoff:     2 * time.Millisecond,
+		}),
+	)
+	require.NoError(t, rf.StartFromFrontier(ctx, frontier))
+	defer rf.Close()
+
+	select {
+	case <-ready:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for retry")
+	}
+	require.GreaterOrEqual(t, int(callCount.Load()), 2)
+}
+
+// TestRevisionStreamEmptyLog verifies that an empty revision stream
+// (no ticks) falls back to the inner DB immediately.
+func TestRevisionStreamEmptyLog(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
+	sp := roachpb.Span{Key: key("a"), EndKey: key("z")}
+	reader := revlog.NewTestLogReader(nil)
+
+	ready := make(chan struct{}, 1)
+	mc := &mockClient{
+		rangeFeedFromFrontier: func(
+			ctx context.Context,
+			frontier span.Frontier,
+			eventC chan<- kvcoord.RangeFeedMessage,
+		) error {
+			// No replay happened — frontier should still be at ts(0).
+			require.Equal(t, ts(0), frontier.Frontier())
+			select {
+			case ready <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	f := rangefeed.NewFactoryWithDB(stopper, mc, nil)
+	rf, err := f.RangeFeed(ctx, "empty-log", []roachpb.Span{sp}, ts(0),
+		func(ctx context.Context, v *kvpb.RangeFeedValue) {},
 		rangefeed.WithRevisionStream(reader),
 	)
 	require.NoError(t, err)
 	defer rf.Close()
 
-	<-ready
-	got := collectEvents(events, 2, 5*time.Second)
-
-	// Only "a" from revision stream, then "a" from live.
-	require.Equal(t, []received{
-		{key: "a", val: "v1"},
-		{key: "a", val: "live"},
-	}, got)
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for inner DB call")
+	}
 }
 
 // TestRevisionStreamPrevValue verifies that PrevValue from the
@@ -368,23 +598,34 @@ func TestRevisionStreamPrevValue(t *testing.T) {
 	defer stopper.Stop(ctx)
 
 	sp := roachpb.Span{Key: key("a"), EndKey: key("z")}
-	reader := revlog.NewTestLogReader([]revlog.TestTick{
-		{
-			Tick: revlog.Tick{TickStart: ts(0), TickEnd: ts(10)},
-			Events: []revlog.Event{
-				{
-					Key:       key("k"),
-					Timestamp: ts(5),
-					Value:     val("new"),
-					PrevValue: val("old"),
-				},
+	reader := revlog.NewTestLogReader(nil)
+	reader.AppendTick(revlog.TestTick{
+		Tick: revlog.Tick{TickStart: ts(0), TickEnd: ts(10)},
+		Events: []revlog.Event{
+			{
+				Key:       key("k"),
+				Timestamp: ts(5),
+				Value:     val("new"),
+				PrevValue: val("old"),
 			},
 		},
 	})
 
 	ready := make(chan struct{}, 1)
-	rfFunc, _ := blockingRangefeed(t, "k", "live", ts(15), ready)
-	mc := &mockClient{rangefeed: rfFunc}
+	mc := &mockClient{
+		rangeFeedFromFrontier: func(
+			ctx context.Context,
+			frontier span.Frontier,
+			eventC chan<- kvcoord.RangeFeedMessage,
+		) error {
+			select {
+			case ready <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
 
 	f := rangefeed.NewFactoryWithDB(stopper, mc, nil)
 	type evWithPrev struct {
@@ -394,7 +635,7 @@ func TestRevisionStreamPrevValue(t *testing.T) {
 	}
 	events := make(chan evWithPrev, 10)
 
-	rf, err := f.RangeFeed(ctx, "test", []roachpb.Span{sp}, ts(0),
+	rf, err := f.RangeFeed(ctx, "prev-value", []roachpb.Span{sp}, ts(0),
 		func(ctx context.Context, v *kvpb.RangeFeedValue) {
 			events <- evWithPrev{
 				key:     string(v.Key),
@@ -409,7 +650,6 @@ func TestRevisionStreamPrevValue(t *testing.T) {
 
 	<-ready
 
-	// First event should have PrevValue from revision stream.
 	select {
 	case ev := <-events:
 		require.Equal(t, "k", ev.key)

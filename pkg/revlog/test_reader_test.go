@@ -7,6 +7,7 @@ package revlog
 
 import (
 	"context"
+	"math/rand"
 	"testing"
 	"time"
 
@@ -188,4 +189,116 @@ func TestTestLogReaderPrevValue(t *testing.T) {
 	require.Len(t, events, 1)
 	require.Equal(t, "new", string(events[0].Value.RawBytes))
 	require.Equal(t, "old", string(events[0].PrevValue.RawBytes))
+}
+
+func TestTestLogReaderGenerate(t *testing.T) {
+	ctx := context.Background()
+
+	spans := []roachpb.Span{
+		{Key: key("a"), EndKey: key("m")},
+		{Key: key("m"), EndKey: key("z")},
+	}
+
+	t.Run("generates correct number of ticks", func(t *testing.T) {
+		r := &TestLogReader{}
+		rng := rand.New(rand.NewSource(42))
+		endTS := r.Generate(rng, ts(0), 5, spans)
+
+		ticks := collectAllTicks(t, r, ctx, ts(0), endTS)
+		require.Len(t, ticks, 5)
+
+		// Each tick is TickInterval (10s) apart.
+		for i, tick := range ticks {
+			require.Equal(t, ts(int64(i)*10), tick.TickStart)
+			require.Equal(t, ts(int64(i+1)*10), tick.TickEnd)
+		}
+
+		// End timestamp is the end of the last tick.
+		require.Equal(t, ts(50), endTS)
+	})
+
+	t.Run("events fall within span and tick bounds", func(t *testing.T) {
+		r := &TestLogReader{}
+		rng := rand.New(rand.NewSource(123))
+		endTS := r.Generate(rng, ts(0), 10, spans)
+
+		var totalEvents int
+		for tick, err := range r.Ticks(ctx, ts(0), endTS) {
+			require.NoError(t, err)
+			tr := r.GetTickReader(ctx, tick, nil)
+			for ev, err := range tr.Events(ctx) {
+				require.NoError(t, err)
+				totalEvents++
+
+				// Event timestamp must be within (TickStart, TickEnd].
+				require.True(t, tick.TickStart.Less(ev.Timestamp),
+					"event ts %s should be > tick start %s", ev.Timestamp, tick.TickStart)
+				require.True(t, !tick.TickEnd.Less(ev.Timestamp),
+					"event ts %s should be <= tick end %s", ev.Timestamp, tick.TickEnd)
+
+				// Event key must fall in at least one span.
+				require.True(t, keyInAnySpan(ev.Key, spans),
+					"key %q should fall in one of the spans", ev.Key)
+			}
+		}
+		// With 10 ticks and 2 spans, we should have some events
+		// (probabilistic, but 50% chance per span means ~10 on average).
+		require.Greater(t, totalEvents, 0)
+	})
+
+	t.Run("deterministic with same seed", func(t *testing.T) {
+		r1 := &TestLogReader{}
+		r1.Generate(rand.New(rand.NewSource(99)), ts(0), 5, spans)
+
+		r2 := &TestLogReader{}
+		r2.Generate(rand.New(rand.NewSource(99)), ts(0), 5, spans)
+
+		ticks1 := collectAllTicks(t, r1, ctx, ts(0), ts(50))
+		ticks2 := collectAllTicks(t, r2, ctx, ts(0), ts(50))
+		require.Equal(t, len(ticks1), len(ticks2))
+
+		for i := range ticks1 {
+			events1 := collectTickEvents(t, r1, ctx, ticks1[i])
+			events2 := collectTickEvents(t, r2, ctx, ticks2[i])
+			require.Equal(t, len(events1), len(events2))
+			for j := range events1 {
+				require.Equal(t, events1[j].Key, events2[j].Key)
+				require.Equal(t, events1[j].Timestamp, events2[j].Timestamp)
+			}
+		}
+	})
+}
+
+func collectAllTicks(
+	t *testing.T, r *TestLogReader, ctx context.Context, start, end hlc.Timestamp,
+) []Tick {
+	t.Helper()
+	var out []Tick
+	for tick, err := range r.Ticks(ctx, start, end) {
+		require.NoError(t, err)
+		out = append(out, tick)
+	}
+	return out
+}
+
+func collectTickEvents(
+	t *testing.T, r *TestLogReader, ctx context.Context, tick Tick,
+) []Event {
+	t.Helper()
+	tr := r.GetTickReader(ctx, tick, nil)
+	var out []Event
+	for ev, err := range tr.Events(ctx) {
+		require.NoError(t, err)
+		out = append(out, ev)
+	}
+	return out
+}
+
+func keyInAnySpan(k roachpb.Key, spans []roachpb.Span) bool {
+	for _, sp := range spans {
+		if k.Compare(sp.Key) >= 0 && k.Compare(sp.EndKey) < 0 {
+			return true
+		}
+	}
+	return false
 }

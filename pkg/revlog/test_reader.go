@@ -8,7 +8,9 @@ package revlog
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"iter"
+	"math/rand"
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -26,9 +28,9 @@ type TestTick struct {
 // concurrent appending via AppendTick for tests that simulate a
 // live revision stream writer.
 type TestLogReader struct {
-	mu           sync.Mutex
-	ticks        []TestTick
-	coveredSpans []roachpb.Span
+	mu     sync.Mutex
+	ticks  []TestTick
+	epochs []CoverageEpoch
 }
 
 // NewTestLogReader constructs a TestLogReader from the given ticks.
@@ -44,29 +46,45 @@ func (r *TestLogReader) AppendTick(tick TestTick) {
 	r.ticks = append(r.ticks, tick)
 }
 
-// SetCoveredSpans sets the spans that the test reader reports as
-// covered. If not set (nil), Covered returns true for all spans.
-func (r *TestLogReader) SetCoveredSpans(spans []roachpb.Span) {
+// AddCoverageEpoch adds a coverage epoch. Epochs must be added in
+// chronological order. The epoch is in effect from EffectiveFrom
+// until the next epoch's EffectiveFrom (or forever if it's the
+// last one). EffectiveTo is ignored — it's computed from the next
+// epoch. If no epochs are added, all spans are covered by default.
+func (r *TestLogReader) AddCoverageEpoch(epoch CoverageEpoch) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.coveredSpans = spans
+	r.epochs = append(r.epochs, epoch)
 }
 
-// CoveredSpans implements LogReader. If SetCoveredSpans was called,
-// returns the subset of requested spans that are fully contained by
-// at least one covered span. If coveredSpans is nil (the default),
-// all requested spans are returned as covered.
+// CoveredSpans implements LogReader. Finds the epoch in effect at
+// the tick's start time and returns the subset of requested spans
+// covered by that epoch. If no epochs have been added, all
+// requested spans are returned as covered.
 func (r *TestLogReader) CoveredSpans(
-	_ context.Context, _ Tick, spans []roachpb.Span,
+	_ context.Context, tick Tick, spans []roachpb.Span,
 ) []roachpb.Span {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.coveredSpans == nil {
+	// Assume if no epochs were added the test just wants to cover all spans.
+	if len(r.epochs) == 0 {
+		return spans
+	}
+	// Find the last epoch whose EffectiveFrom <= tick.TickStart.
+	var epoch *CoverageEpoch
+	for i := len(r.epochs) - 1; i >= 0; i-- {
+		if !tick.TickStart.Less(r.epochs[i].EffectiveFrom) {
+			epoch = &r.epochs[i]
+			break
+		}
+	}
+	if epoch == nil {
+		// Tick is before any epoch — treat as fully covered.
 		return spans
 	}
 	var result []roachpb.Span
 	for _, requested := range spans {
-		if spanContained(requested, r.coveredSpans) {
+		if spanContained(requested, epoch.Spans) {
 			result = append(result, requested)
 		}
 	}
@@ -154,6 +172,58 @@ func (tr *testTickReader) Events(_ context.Context) iter.Seq2[Event, error] {
 			}
 		}
 	}
+}
+
+// Generate populates the reader with numTicks ticks starting at
+// startTime, each TickInterval (10s) apart. For each tick and each
+// span, there is a 50% chance of generating 0 events; otherwise 1–3
+// events are generated with keys inside the span and timestamps
+// within the tick's time window. Returns the end timestamp of the
+// last generated tick.
+//
+// Keys are constructed by appending a sequence number to the span's
+// start key, so they are guaranteed to fall within the span. Values
+// are synthetic byte strings.
+func (r *TestLogReader) Generate(
+	rng *rand.Rand, startTime hlc.Timestamp, numTicks int, spans []roachpb.Span,
+) hlc.Timestamp {
+	tickStart := startTime
+	var seq int
+	for i := range numTicks {
+		tickEnd := tickStart.Add(TickInterval.Nanoseconds(), 0)
+		var events []Event
+		for _, sp := range spans {
+			// 50% chance of no events for this span in this tick.
+			if rng.Intn(2) == 0 {
+				continue
+			}
+			n := 1 + rng.Intn(3) // 1–3 events
+			for range n {
+				seq++
+				// Place the timestamp randomly within (tickStart, tickEnd].
+				offsetNanos := 1 + rng.Int63n(TickInterval.Nanoseconds())
+				evTS := tickStart.Add(offsetNanos, 0)
+				if tickEnd.Less(evTS) {
+					evTS = tickEnd
+				}
+				// Build a key inside the span by appending to span.Key.
+				k := append(sp.Key.Clone(), []byte(fmt.Sprintf("-gen-%04d-%04d", i, seq))...)
+				events = append(events, Event{
+					Key:       k,
+					Timestamp: evTS,
+					Value: roachpb.Value{
+						RawBytes: []byte(fmt.Sprintf("val-%04d", seq)),
+					},
+				})
+			}
+		}
+		r.AppendTick(TestTick{
+			Tick:   Tick{TickStart: tickStart, TickEnd: tickEnd},
+			Events: events,
+		})
+		tickStart = tickEnd
+	}
+	return tickStart
 }
 
 func keyInSpans(key roachpb.Key, spans []roachpb.Span) bool {
