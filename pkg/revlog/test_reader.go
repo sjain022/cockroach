@@ -13,6 +13,7 @@ import (
 	"math/rand"
 	"sync"
 
+	"github.com/cockroachdb/cockroach/pkg/revlog/revlogpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
@@ -70,10 +71,10 @@ func (r *TestLogReader) CoveredSpans(
 	if len(r.epochs) == 0 {
 		return spans
 	}
-	// Find the last epoch whose EffectiveFrom <= tick.TickStart.
+	// Find the last epoch whose EffectiveFrom <= tick.Manifest.TickStart.
 	var epoch *CoverageEpoch
 	for i := len(r.epochs) - 1; i >= 0; i-- {
-		if !tick.TickStart.Less(r.epochs[i].EffectiveFrom) {
+		if !tick.Manifest.TickStart.Less(r.epochs[i].EffectiveFrom) {
 			epoch = &r.epochs[i]
 			break
 		}
@@ -110,7 +111,7 @@ func (r *TestLogReader) LatestResolved(_ context.Context) (hlc.Timestamp, error)
 	if len(r.ticks) == 0 {
 		return hlc.Timestamp{}, nil
 	}
-	return r.ticks[len(r.ticks)-1].Tick.TickEnd, nil
+	return r.ticks[len(r.ticks)-1].Tick.EndTime, nil
 }
 
 // Ticks implements LogReader. Returns ticks whose coverage (TickStart,
@@ -121,10 +122,10 @@ func (r *TestLogReader) Ticks(
 	ticks := r.tickSnapshot()
 	return func(yield func(Tick, error) bool) {
 		for _, tt := range ticks {
-			if !start.Less(tt.Tick.TickEnd) {
+			if !start.Less(tt.Tick.EndTime) {
 				continue
 			}
-			if !tt.Tick.TickStart.Less(end) {
+			if !tt.Tick.Manifest.TickStart.Less(end) {
 				return
 			}
 			if !yield(tt.Tick, nil) {
@@ -147,7 +148,7 @@ func (r *TestLogReader) GetTickReader(
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, tt := range r.ticks {
-		if tt.Tick.TickStart.Equal(tick.TickStart) && tt.Tick.TickEnd.Equal(tick.TickEnd) {
+		if tt.Tick.Manifest.TickStart.Equal(tick.Manifest.TickStart) && tt.Tick.EndTime.Equal(tick.EndTime) {
 			return &testTickReader{events: tt.Events, spans: spans}
 		}
 	}
@@ -218,7 +219,7 @@ func (r *TestLogReader) Generate(
 			}
 		}
 		r.AppendTick(TestTick{
-			Tick:   Tick{TickStart: tickStart, TickEnd: tickEnd},
+			Tick:   Tick{EndTime: tickEnd, Manifest: revlogpb.Manifest{TickStart: tickStart, TickEnd: tickEnd}},
 			Events: events,
 		})
 		tickStart = tickEnd

@@ -11,10 +11,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/revlog/revlogpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/stretchr/testify/require"
 )
+
+func testTick(start, end hlc.Timestamp) Tick {
+	return Tick{EndTime: end, Manifest: revlogpb.Manifest{TickStart: start, TickEnd: end}}
+}
 
 // ts builds an hlc.Timestamp at the given second offset.
 func ts(sec int64) hlc.Timestamp {
@@ -39,15 +44,15 @@ func ev(k string, sec int64, v string) Event {
 func threeTicks() *TestLogReader {
 	return &TestLogReader{ticks: []TestTick{
 		{
-			Tick:   Tick{TickStart: ts(0), TickEnd: ts(10)},
+			Tick:   testTick(ts(0), ts(10)),
 			Events: []Event{ev("a", 5, "v1"), ev("b", 7, "v2")},
 		},
 		{
-			Tick:   Tick{TickStart: ts(10), TickEnd: ts(20)},
+			Tick:   testTick(ts(10), ts(20)),
 			Events: []Event{ev("c", 12, "v3")},
 		},
 		{
-			Tick:   Tick{TickStart: ts(20), TickEnd: ts(30)},
+			Tick:   testTick(ts(20), ts(30)),
 			Events: []Event{ev("a", 25, "v4"), ev("d", 28, "v5")},
 		},
 	}}
@@ -88,24 +93,24 @@ func TestTestLogReaderTicks(t *testing.T) {
 		// (0s, 30s] should return all three ticks.
 		ticks := collectTicks(ts(0), ts(30))
 		require.Len(t, ticks, 3)
-		require.Equal(t, ts(10), ticks[0].TickEnd)
-		require.Equal(t, ts(20), ticks[1].TickEnd)
-		require.Equal(t, ts(30), ticks[2].TickEnd)
+		require.Equal(t, ts(10), ticks[0].EndTime)
+		require.Equal(t, ts(20), ticks[1].EndTime)
+		require.Equal(t, ts(30), ticks[2].EndTime)
 	})
 
 	t.Run("partial range", func(t *testing.T) {
 		// (10s, 25s] overlaps tick2 (10,20] and tick3 (20,30].
 		ticks := collectTicks(ts(10), ts(25))
 		require.Len(t, ticks, 2)
-		require.Equal(t, ts(20), ticks[0].TickEnd)
-		require.Equal(t, ts(30), ticks[1].TickEnd)
+		require.Equal(t, ts(20), ticks[0].EndTime)
+		require.Equal(t, ts(30), ticks[1].EndTime)
 	})
 
 	t.Run("exact tick boundary", func(t *testing.T) {
 		// (10s, 20s] returns only tick2.
 		ticks := collectTicks(ts(10), ts(20))
 		require.Len(t, ticks, 1)
-		require.Equal(t, ts(20), ticks[0].TickEnd)
+		require.Equal(t, ts(20), ticks[0].EndTime)
 	})
 
 	t.Run("no overlap", func(t *testing.T) {
@@ -119,7 +124,7 @@ func TestTestLogReaderTicks(t *testing.T) {
 		// not greater than start, so tick2 is excluded. Only tick3.
 		ticks := collectTicks(ts(20), ts(30))
 		require.Len(t, ticks, 1)
-		require.Equal(t, ts(30), ticks[0].TickEnd)
+		require.Equal(t, ts(30), ticks[0].EndTime)
 	})
 }
 
@@ -138,7 +143,7 @@ func TestTestLogReaderGetTickReader(t *testing.T) {
 	}
 
 	t.Run("all events in tick", func(t *testing.T) {
-		events := collectEvents(Tick{TickStart: ts(0), TickEnd: ts(10)}, nil)
+		events := collectEvents(testTick(ts(0), ts(10)), nil)
 		require.Len(t, events, 2)
 		require.Equal(t, "a", string(events[0].Key))
 		require.Equal(t, "b", string(events[1].Key))
@@ -147,19 +152,19 @@ func TestTestLogReaderGetTickReader(t *testing.T) {
 	t.Run("span filter", func(t *testing.T) {
 		// Only keys in [a, b) — should return "a" but not "b".
 		spans := []roachpb.Span{{Key: key("a"), EndKey: key("b")}}
-		events := collectEvents(Tick{TickStart: ts(0), TickEnd: ts(10)}, spans)
+		events := collectEvents(testTick(ts(0), ts(10)), spans)
 		require.Len(t, events, 1)
 		require.Equal(t, "a", string(events[0].Key))
 	})
 
 	t.Run("span filter excludes all", func(t *testing.T) {
 		spans := []roachpb.Span{{Key: key("x"), EndKey: key("z")}}
-		events := collectEvents(Tick{TickStart: ts(0), TickEnd: ts(10)}, spans)
+		events := collectEvents(testTick(ts(0), ts(10)), spans)
 		require.Empty(t, events)
 	})
 
 	t.Run("unknown tick returns empty", func(t *testing.T) {
-		events := collectEvents(Tick{TickStart: ts(99), TickEnd: ts(100)}, nil)
+		events := collectEvents(testTick(ts(99), ts(100)), nil)
 		require.Empty(t, events)
 	})
 }
@@ -168,7 +173,7 @@ func TestTestLogReaderPrevValue(t *testing.T) {
 	ctx := context.Background()
 	r := &TestLogReader{ticks: []TestTick{
 		{
-			Tick: Tick{TickStart: ts(0), TickEnd: ts(10)},
+			Tick: testTick(ts(0), ts(10)),
 			Events: []Event{
 				{
 					Key:       key("k"),
@@ -180,7 +185,7 @@ func TestTestLogReaderPrevValue(t *testing.T) {
 		},
 	}}
 
-	tr := r.GetTickReader(ctx, Tick{TickStart: ts(0), TickEnd: ts(10)}, nil)
+	tr := r.GetTickReader(ctx, testTick(ts(0), ts(10)), nil)
 	var events []Event
 	for ev, err := range tr.Events(ctx) {
 		require.NoError(t, err)
@@ -209,8 +214,8 @@ func TestTestLogReaderGenerate(t *testing.T) {
 
 		// Each tick is TickInterval (10s) apart.
 		for i, tick := range ticks {
-			require.Equal(t, ts(int64(i)*10), tick.TickStart)
-			require.Equal(t, ts(int64(i+1)*10), tick.TickEnd)
+			require.Equal(t, ts(int64(i)*10), tick.Manifest.TickStart)
+			require.Equal(t, ts(int64(i+1)*10), tick.EndTime)
 		}
 
 		// End timestamp is the end of the last tick.
@@ -231,10 +236,10 @@ func TestTestLogReaderGenerate(t *testing.T) {
 				totalEvents++
 
 				// Event timestamp must be within (TickStart, TickEnd].
-				require.True(t, tick.TickStart.Less(ev.Timestamp),
-					"event ts %s should be > tick start %s", ev.Timestamp, tick.TickStart)
-				require.True(t, !tick.TickEnd.Less(ev.Timestamp),
-					"event ts %s should be <= tick end %s", ev.Timestamp, tick.TickEnd)
+				require.True(t, tick.Manifest.TickStart.Less(ev.Timestamp),
+					"event ts %s should be > tick start %s", ev.Timestamp, tick.Manifest.TickStart)
+				require.True(t, !tick.EndTime.Less(ev.Timestamp),
+					"event ts %s should be <= tick end %s", ev.Timestamp, tick.EndTime)
 
 				// Event key must fall in at least one span.
 				require.True(t, keyInAnySpan(ev.Key, spans),

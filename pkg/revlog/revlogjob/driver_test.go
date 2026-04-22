@@ -65,7 +65,7 @@ func readBackTicks(
 	t *testing.T, ctx context.Context, es cloud.ExternalStorage, start, end hlc.Timestamp,
 ) []revlog.Tick {
 	t.Helper()
-	lr := revlog.NewLogReader(es)
+	lr := revlog.NewLogReaderImpl(es)
 	var out []revlog.Tick
 	for tk, err := range lr.Ticks(ctx, start, end) {
 		require.NoError(t, err)
@@ -78,7 +78,7 @@ func readBackEvents(
 	t *testing.T, ctx context.Context, es cloud.ExternalStorage, tk revlog.Tick,
 ) []revlog.Event {
 	t.Helper()
-	lr := revlog.NewLogReader(es)
+	lr := revlog.NewLogReaderImpl(es)
 	var out []revlog.Event
 	for ev, err := range lr.GetTickReader(ctx, tk, nil).Events(ctx) {
 		require.NoError(t, err)

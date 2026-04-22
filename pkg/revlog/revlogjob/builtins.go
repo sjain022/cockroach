@@ -251,7 +251,7 @@ func (g *revlogTicksGen) Start(ctx context.Context, _ *kv.Txn) error {
 		return err
 	}
 	g.es = es
-	lr := revlog.NewLogReader(es)
+	lr := revlog.NewLogReaderImpl(es)
 	g.next, g.stop = iter.Pull2(lr.Ticks(ctx, g.start, g.end))
 	return nil
 }
@@ -324,7 +324,7 @@ func (g *revlogChangesGen) Start(ctx context.Context, _ *kv.Txn) error {
 		return err
 	}
 	g.es = es
-	lr := revlog.NewLogReader(es)
+	lr := revlog.NewLogReaderImpl(es)
 
 	// (tickEnd.Prev, tickEnd] is the narrowest window that includes the
 	// tick at tickEnd, given Ticks's half-open upper-inclusive semantics.

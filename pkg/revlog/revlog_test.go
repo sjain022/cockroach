@@ -88,7 +88,7 @@ func sealTick(
 // collectTicks drains a Ticks iterator into a slice. Any error stops
 // iteration and is returned.
 func collectTicks(
-	t *testing.T, lr *revlog.LogReader, ctx context.Context, start, end hlc.Timestamp,
+	t *testing.T, lr revlog.LogReader, ctx context.Context, start, end hlc.Timestamp,
 ) []revlog.Tick {
 	t.Helper()
 	var out []revlog.Tick
@@ -100,7 +100,7 @@ func collectTicks(
 }
 
 // collectEvents drains a TickReader.Events iterator into a slice.
-func collectEvents(t *testing.T, tr *revlog.TickReader, ctx context.Context) []revlog.Event {
+func collectEvents(t *testing.T, tr revlog.TickReader, ctx context.Context) []revlog.Event {
 	t.Helper()
 	var out []revlog.Event
 	for ev, err := range tr.Events(ctx) {
@@ -162,7 +162,7 @@ func TestRoundTripSingleFile(t *testing.T) {
 	f := writeTick(t, ctx, es, te, 1, 0, in)
 	sealTick(t, ctx, es, te, []revlogpb.File{f})
 
-	lr := revlog.NewLogReader(es)
+	lr := revlog.NewLogReaderImpl(es)
 	ticks := collectTicks(t, lr, ctx, te.Prev(), te)
 	require.Len(t, ticks, 1)
 	require.Equal(t, te, ticks[0].EndTime)
@@ -196,7 +196,7 @@ func TestCoverageOverlap(t *testing.T) {
 		sealTick(t, ctx, es, te, []revlogpb.File{f})
 	}
 
-	lr := revlog.NewLogReader(es)
+	lr := revlog.NewLogReaderImpl(es)
 
 	// Window (15:30:08, 15:30:22]. Caller doesn't know tick width.
 	// Coverage: t10 covers (00, 10] → overlaps at (08, 10]; t20
@@ -247,7 +247,7 @@ func TestExplicitTickStart(t *testing.T) {
 		Files:     []revlogpb.File{f},
 	}))
 
-	lr := revlog.NewLogReader(es)
+	lr := revlog.NewLogReaderImpl(es)
 
 	// Window (15:30:05, 15:30:08]: would overlap the implicit
 	// coverage (15:30:00, 15:30:10] — but does NOT overlap the
@@ -288,7 +288,7 @@ func TestEnumerationAcrossHours(t *testing.T) {
 		sealTick(t, ctx, es, te, []revlogpb.File{f})
 	}
 
-	lr := revlog.NewLogReader(es)
+	lr := revlog.NewLogReaderImpl(es)
 
 	// Full range: all four ticks via (t1.Prev, t4].
 	all := collectTicks(t, lr, ctx, t1.Prev(), t4)
@@ -331,7 +331,7 @@ func TestSpanFilter(t *testing.T) {
 	f := writeTick(t, ctx, es, te, 1, 0, in)
 	sealTick(t, ctx, es, te, []revlogpb.File{f})
 
-	lr := revlog.NewLogReader(es)
+	lr := revlog.NewLogReaderImpl(es)
 	ticks := collectTicks(t, lr, ctx, te.Prev(), te)
 	require.Len(t, ticks, 1)
 
@@ -376,7 +376,7 @@ func TestFlushOrderAcrossFiles(t *testing.T) {
 	// the reader sorts by flush_order.
 	sealTick(t, ctx, es, te, []revlogpb.File{f1, f0b, f0a})
 
-	lr := revlog.NewLogReader(es)
+	lr := revlog.NewLogReaderImpl(es)
 	ticks := collectTicks(t, lr, ctx, te.Prev(), te)
 	require.Len(t, ticks, 1)
 
@@ -406,7 +406,7 @@ func TestPerKeyAscendingTimestampWithinFile(t *testing.T) {
 	f := writeTick(t, ctx, es, te, 1, 0, in)
 	sealTick(t, ctx, es, te, []revlogpb.File{f})
 
-	lr := revlog.NewLogReader(es)
+	lr := revlog.NewLogReaderImpl(es)
 	ticks := collectTicks(t, lr, ctx, te.Prev(), te)
 	require.Len(t, ticks, 1)
 	got := collectEvents(t, lr.GetTickReader(ctx, ticks[0], nil), ctx)
@@ -435,7 +435,7 @@ func TestCorruptManifestRejected(t *testing.T) {
 	body[0] ^= 0xff
 	require.NoError(t, os.WriteFile(markerPath, body, 0o644))
 
-	lr := revlog.NewLogReader(es)
+	lr := revlog.NewLogReaderImpl(es)
 	var sawErr error
 	for _, err := range lr.Ticks(ctx, te.Prev(), te) {
 		if err != nil {

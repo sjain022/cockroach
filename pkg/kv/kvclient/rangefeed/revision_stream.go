@@ -169,10 +169,6 @@ func (rs *revisionStreamDB) replayLog(
 		now := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
 		for tick, err := range rs.reader.Ticks(ctx, cursor, now) {
 			if err != nil {
-				if errors.Is(err, revlog.ErrUnclosedTick) {
-					// We've caught up to the head of the revision log — hand off to KV for the rest.
-					return nil
-				}
 				return err
 			}
 
@@ -193,11 +189,11 @@ func (rs *revisionStreamDB) replayLog(
 
 			// Note that because the Ticks iterator only returns closed Ticks,
 			// we will never have to re-emit older events.
-			if err := rs.emitCheckpoints(ctx, watchedSpans, tick.TickEnd, eventC, onCheckpoint); err != nil {
+			if err := rs.emitCheckpoints(ctx, watchedSpans, tick.EndTime, eventC, onCheckpoint); err != nil {
 				return err
 			}
+			cursor = tick.EndTime
 		}
-		cursor = now
 	}
 }
 

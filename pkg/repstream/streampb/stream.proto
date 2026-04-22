@@ -155,11 +155,7 @@ message StreamPartitionSpec {
   // emits in (timestamp, key) order on frontier advancement.
   bool with_mvcc_ordering = 13;
 
-  // RevisionStreamURI, if non-empty, is the external storage URI of a
-  // revision stream (continuous backup log) covering this partition's
-  // spans. When set, the producer serves the rangefeed catch-up phase
-  // from the revision stream instead of from KV's MVCC history.
-  string revision_stream_uri = 14 [(gogoproto.customname) = "RevisionStreamURI"];
+  reserved 14;
 
   // NEXT ID: 15.
 }

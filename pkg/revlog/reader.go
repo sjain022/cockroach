@@ -23,20 +23,16 @@ import (
 	"github.com/cockroachdb/pebble/sstable"
 )
 
-// LogReader discovers and opens closed ticks in the revlog.
-//
-// LogReader is the top-level read entry point. The discovery path
-// (Ticks) walks log/resolved/ to enumerate which ticks have closed in
-// a given window; the consumption path (GetTickReader) opens the
-// data files of one tick for iteration.
-type LogReader struct {
+// LogReaderImpl discovers and opens closed ticks in the revlog. It
+// implements the LogReader interface backed by external storage.
+type LogReaderImpl struct {
 	es cloud.ExternalStorage
 }
 
-// NewLogReader opens the log at the given external storage. The
+// NewLogReaderImpl opens the log at the given external storage. The
 // storage handle's root is treated as the "log/" directory.
-func NewLogReader(es cloud.ExternalStorage) *LogReader {
-	return &LogReader{es: es}
+func NewLogReaderImpl(es cloud.ExternalStorage) *LogReaderImpl {
+	return &LogReaderImpl{es: es}
 }
 
 // Tick is a discovered closed tick: its end time plus the parsed
@@ -78,7 +74,9 @@ const assumedMaxTickWidth = time.Minute
 // multi-year window degenerates to LISTing log/resolved/ entirely.
 //
 // Listing or read errors abort iteration and are yielded once.
-func (lr *LogReader) Ticks(ctx context.Context, start, end hlc.Timestamp) iter.Seq2[Tick, error] {
+func (lr *LogReaderImpl) Ticks(
+	ctx context.Context, start, end hlc.Timestamp,
+) iter.Seq2[Tick, error] {
 	return func(yield func(Tick, error) bool) {
 		// Empty or inverted window: no ticks possible.
 		if !start.Less(end) {
@@ -200,8 +198,41 @@ func commonStringPrefix(a, b string) string {
 // Spans must be sorted by start key and non-overlapping; the iterator
 // advances through them in order. The caller retains ownership of
 // the slice.
-func (lr *LogReader) GetTickReader(ctx context.Context, t Tick, spans []roachpb.Span) *TickReader {
-	return &TickReader{
+// CoveredSpans returns the subset of the given spans that are covered
+// by the revision stream at the given tick. Delegates to CoverageAt
+// to find the active coverage epoch; if no coverage exists, all
+// spans are assumed covered.
+func (lr *LogReaderImpl) CoveredSpans(
+	ctx context.Context, tick Tick, spans []roachpb.Span,
+) []roachpb.Span {
+	cov, ok, err := CoverageAt(ctx, lr.es, tick.Manifest.TickStart)
+	if err != nil || !ok {
+		return spans
+	}
+	var result []roachpb.Span
+	for _, requested := range spans {
+		for _, covered := range cov.Spans {
+			if bytes.Compare(requested.Key, covered.Key) >= 0 &&
+				bytes.Compare(requested.EndKey, covered.EndKey) <= 0 {
+				result = append(result, requested)
+				break
+			}
+		}
+	}
+	return result
+}
+
+// GetTickReader opens one tick for iteration. The reader emits events
+// whose user_keys fall in any of the requested spans. If spans is
+// empty, all events in the tick are emitted.
+//
+// Spans must be sorted by start key and non-overlapping; the iterator
+// advances through them in order. The caller retains ownership of
+// the slice.
+func (lr *LogReaderImpl) GetTickReader(
+	ctx context.Context, t Tick, spans []roachpb.Span,
+) TickReader {
+	return &TickReaderImpl{
 		es:    lr.es,
 		tick:  t,
 		spans: spans,
@@ -216,9 +247,10 @@ type Event struct {
 	PrevValue roachpb.Value // zero-value if no diff
 }
 
-// TickReader iterates events in one tick, in per-key revision order,
-// restricted to the configured spans.
-type TickReader struct {
+// TickReaderImpl iterates events in one tick, in per-key revision
+// order, restricted to the configured spans. It implements the
+// TickReader interface backed by external storage.
+type TickReaderImpl struct {
 	es    cloud.ExternalStorage
 	tick  Tick
 	spans []roachpb.Span
@@ -233,7 +265,7 @@ type TickReader struct {
 //
 // If reading or decoding any file fails, iteration stops and the
 // error is yielded once.
-func (tr *TickReader) Events(ctx context.Context) iter.Seq2[Event, error] {
+func (tr *TickReaderImpl) Events(ctx context.Context) iter.Seq2[Event, error] {
 	return func(yield func(Event, error) bool) {
 		// Stable-sort the manifest's files by flush_order. Stable so
 		// ties preserve manifest order, matching the spec's "any
@@ -256,7 +288,7 @@ func (tr *TickReader) Events(ctx context.Context) iter.Seq2[Event, error] {
 // Returns an error only on a hard failure (read, parse, or decode);
 // returning nil with the iteration cut short by yield returning false
 // is the "consumer stopped" path.
-func (tr *TickReader) emitFile(
+func (tr *TickReaderImpl) emitFile(
 	ctx context.Context, f revlogpb.File, yield func(Event, error) bool,
 ) error {
 	name := DataFilePath(tr.tick.EndTime, f.FileID)
@@ -372,3 +404,6 @@ func readManifest(
 func isNotFound(err error) bool {
 	return errors.Is(err, cloud.ErrFileDoesNotExist) || errors.Is(err, cloud.ErrListingDone)
 }
+
+var _ LogReader = (*LogReaderImpl)(nil)
+var _ TickReader = (*TickReaderImpl)(nil)

@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/revlog"
+	"github.com/cockroachdb/cockroach/pkg/revlog/revlogpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -600,7 +601,7 @@ func TestRevisionStreamPrevValue(t *testing.T) {
 	sp := roachpb.Span{Key: key("a"), EndKey: key("z")}
 	reader := revlog.NewTestLogReader(nil)
 	reader.AppendTick(revlog.TestTick{
-		Tick: revlog.Tick{TickStart: ts(0), TickEnd: ts(10)},
+		Tick: revlog.Tick{EndTime: ts(10), Manifest: revlogpb.Manifest{TickStart: ts(0), TickEnd: ts(10)}},
 		Events: []revlog.Event{
 			{
 				Key:       key("k"),
