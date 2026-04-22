@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/revlog"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -50,6 +51,7 @@ type config struct {
 	onDeleteRange         OnDeleteRange
 	onMetadata            OnMetadata
 	extraPProfLabels      []string
+	revisionStream        revlog.LogReader
 }
 
 type scanConfig struct {
@@ -369,5 +371,16 @@ func WithSystemTablePriority() Option {
 func WithFrontierQuantized(d time.Duration) Option {
 	return optionFunc(func(c *config) {
 		c.frontierQuantize = d
+	})
+}
+
+// WithRevisionStream configures the rangefeed to serve its catch-up
+// phase from the given revision stream reader instead of from KV's
+// MVCC history. The rangefeed replays closed ticks from the revision
+// stream until the frontier is close to the present, then hands off
+// to a live KV rangefeed for the remaining gap and ongoing events.
+func WithRevisionStream(reader revlog.LogReader) Option {
+	return optionFunc(func(c *config) {
+		c.revisionStream = reader
 	})
 }

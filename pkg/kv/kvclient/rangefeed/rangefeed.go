@@ -164,6 +164,9 @@ func (f *Factory) New(
 		onValue:          onValue,
 	}
 	initConfig(&r.config, options)
+	if r.config.revisionStream != nil {
+		r.client = newRevisionStreamDB(r.client, r.config.revisionStream)
+	}
 	return &r
 }
 

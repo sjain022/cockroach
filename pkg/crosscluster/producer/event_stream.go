@@ -17,9 +17,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
+	"github.com/cockroachdb/cockroach/pkg/revlog"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -198,6 +201,19 @@ func (s *eventStream) Start(ctx context.Context, txn *kv.Txn) (retErr error) {
 	// in the future, but for now, grabbing chunk of memory from the monitor would do the trick.
 	if err := s.acc.Grow(ctx, s.spec.Config.BatchByteSize); err != nil {
 		return errors.Wrapf(err, "failed to allocated %d bytes from monitor", s.spec.Config.BatchByteSize)
+	}
+
+	// If a revision stream URI is configured, open external storage and
+	// construct a LogReader so the rangefeed catch-up phase reads from
+	// the revision stream instead of scanning KV's MVCC history.
+	if s.spec.RevisionStreamURI != "" {
+		reader, err := newRevisionStreamReader(ctx, s.execCfg, s.spec.RevisionStreamURI)
+		if err != nil {
+			log.Dev.Warningf(ctx, "revision stream at %s unavailable, falling back to KV catch-up: %v",
+				s.spec.RevisionStreamURI, err)
+		} else {
+			opts = append(opts, rangefeed.WithRevisionStream(reader))
+		}
 	}
 
 	// Start rangefeed, which spins up a separate go routine to perform its job.
@@ -557,4 +573,22 @@ func streamPartition(
 	}
 	handler.adapter = handler
 	return handler, nil
+}
+
+// newRevisionStreamReader opens external storage at the given URI and
+// constructs a revlog.LogReader for revision stream catch-up. The
+// caller should treat a non-nil error as "revision stream unavailable,
+// fall back to KV catch-up" rather than a fatal error.
+func newRevisionStreamReader(
+	ctx context.Context, execCfg *sql.ExecutorConfig, uri string,
+) (revlog.LogReader, error) {
+	conf, err := cloud.ExternalStorageConfFromURI(uri, username.RootUserName())
+	if err != nil {
+		return nil, errors.Wrap(err, "parsing revision stream URI")
+	}
+	es, err := execCfg.DistSQLSrv.ExternalStorage(ctx, conf)
+	if err != nil {
+		return nil, errors.Wrap(err, "opening revision stream storage")
+	}
+	return revlog.NewLogReader(es), nil
 }

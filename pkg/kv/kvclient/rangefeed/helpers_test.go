@@ -7,6 +7,7 @@ package rangefeed
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -23,6 +24,14 @@ type KVDB = DB
 
 // ScanConfig forwards the definition of scanConfig to tests.
 type ScanConfig = scanConfig
+
+// SetRevisionStreamHandoffThreshold overrides the handoff threshold
+// for the revision stream wrapper and returns a restore function.
+func SetRevisionStreamHandoffThreshold(d time.Duration) func() {
+	old := revisionStreamHandoffThreshold
+	revisionStreamHandoffThreshold = d
+	return func() { revisionStreamHandoffThreshold = old }
+}
 
 // ScanWithOptions is exposed for testing in order to call Scan with scanConfig
 // extracted from the specified list of options.
