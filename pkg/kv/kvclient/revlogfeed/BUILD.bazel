@@ -1,0 +1,33 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "revlogfeed",
+    srcs = ["revlogfeed.go"],
+    importpath = "github.com/cockroachdb/cockroach/pkg/kv/kvclient/revlogfeed",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/kv/kvclient/kvcoord",
+        "//pkg/kv/kvpb",
+        "//pkg/revlog",
+        "//pkg/roachpb",
+        "//pkg/util/hlc",
+        "//pkg/util/timeutil",
+        "@com_github_cockroachdb_errors//:errors",
+    ],
+)
+
+go_test(
+    name = "revlogfeed_test",
+    srcs = ["revlogfeed_test.go"],
+    embed = [":revlogfeed"],
+    deps = [
+        "//pkg/kv/kvclient/kvcoord",
+        "//pkg/kv/kvpb",
+        "//pkg/revlog",
+        "//pkg/revlog/revlogpb",
+        "//pkg/roachpb",
+        "//pkg/util/hlc",
+        "//pkg/util/leaktest",
+        "@com_github_stretchr_testify//require",
+    ],
+)
