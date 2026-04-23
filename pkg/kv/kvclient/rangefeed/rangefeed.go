@@ -164,6 +164,9 @@ func (f *Factory) New(
 		onValue:          onValue,
 	}
 	initConfig(&r.config, options)
+	if r.config.revlogReader != nil {
+		r.client = &revlogfeedAdapter{inner: r.client, reader: r.config.revlogReader}
+	}
 	return &r
 }
 

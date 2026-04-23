@@ -25,28 +25,35 @@ import (
 	"github.com/cockroachdb/pebble/sstable"
 )
 
-// LogReader discovers and opens closed ticks in the revlog.
+// Verify interface compliance.
+var _ LogReader = (*S3LogReader)(nil)
+var _ TickReader = (*S3TickReader)(nil)
+
+// S3LogReader discovers and opens closed ticks in the revlog stored
+// on external storage (S3, GCS, nodelocal, etc.). It implements the
+// LogReader interface.
 //
-// LogReader is the top-level read entry point. The discovery path
+// S3LogReader is the top-level read entry point. The discovery path
 // (Ticks) walks log/resolved/ to enumerate which ticks have closed in
 // a given window; the consumption path (GetTickReader) opens the
 // data files of one tick for iteration.
-type LogReader struct {
+type S3LogReader struct {
 	es cloud.ExternalStorage
 }
 
 // NewLogReader opens the log at the given external storage. The
 // storage handle's root is treated as the "log/" directory.
-func NewLogReader(es cloud.ExternalStorage) *LogReader {
-	return &LogReader{es: es}
+func NewLogReader(es cloud.ExternalStorage) *S3LogReader {
+	return &S3LogReader{es: es}
 }
 
-// Tick is a discovered closed tick: its end time plus the parsed
-// manifest. Returned by LogReader.Ticks; consumed by
-// LogReader.GetTickReader.
+// Tick is a discovered closed tick. TickStart and TickEnd define the
+// coverage interval (TickStart, TickEnd]. Manifest carries the full
+// manifest proto (file list, stats) for callers that need it.
 type Tick struct {
-	EndTime  hlc.Timestamp
-	Manifest revlogpb.Manifest
+	TickStart hlc.Timestamp
+	TickEnd   hlc.Timestamp
+	Manifest  revlogpb.Manifest
 }
 
 // assumedMaxTickWidth is the upper bound on tick width that the
@@ -71,16 +78,16 @@ const assumedMaxTickWidth = time.Minute
 // chain: they say what time window they want and the iterator
 // yields whichever ticks' coverage overlaps it.
 //
-// Discovery is a LIST + per-marker GET: LIST the largest path prefix
-// shared by the smallest and largest possible in-window tick ends —
-// for example "log/resolved/2026-04-20/15-30." for a one-minute
-// window — then GET + verify each in-window marker.
+// Implements steps 1-3 of the read protocol (format §9): LIST the
+// largest path prefix shared by the smallest and largest possible
+// in-window tick ends — for example "log/resolved/2026-04-20/15-30."
+// for a one-minute window — then GET + verify each in-window marker.
 // The shared prefix degrades gracefully: a one-day window LISTs that
 // one day, a one-month window LISTs that month's days, and a
 // multi-year window degenerates to LISTing log/resolved/ entirely.
 //
 // Listing or read errors abort iteration and are yielded once.
-func (lr *LogReader) Ticks(ctx context.Context, start, end hlc.Timestamp) iter.Seq2[Tick, error] {
+func (lr *S3LogReader) Ticks(ctx context.Context, start, end hlc.Timestamp) iter.Seq2[Tick, error] {
 	return func(yield func(Tick, error) bool) {
 		// Empty or inverted window: no ticks possible.
 		if !start.Less(end) {
@@ -177,7 +184,12 @@ func (lr *LogReader) Ticks(ctx context.Context, start, end hlc.Timestamp) iter.S
 				// overlap either.
 				return
 			}
-			if !yield(Tick{EndTime: tickEnd, Manifest: m}, nil) {
+			tick := Tick{
+				TickStart: m.TickStart,
+				TickEnd:   tickEnd,
+				Manifest:  m,
+			}
+			if !yield(tick, nil) {
 				return
 			}
 		}
@@ -195,19 +207,81 @@ func commonStringPrefix(a, b string) string {
 	return a[:n]
 }
 
-// GetTickReader opens one tick for iteration. The reader emits events
-// whose user_keys fall in any of the requested spans. If spans is
-// empty, all events in the tick are emitted.
+// ReadTickManifest downloads and decodes the close marker for a single
+// tick end (log/resolved/<tick-end>.pb). The manifest's TickEnd must
+// match tickEnd (the path is authoritative for the tick identity; the
+// proto field is a cross-check).
+func ReadTickManifest(
+	ctx context.Context, es cloud.ExternalStorage, tickEnd hlc.Timestamp,
+) (revlogpb.Manifest, error) {
+	m, err := readManifest(ctx, es, MarkerPath(tickEnd))
+	if err != nil {
+		return revlogpb.Manifest{}, err
+	}
+	if m.TickEnd.Compare(tickEnd) != 0 {
+		return revlogpb.Manifest{}, errors.Errorf(
+			"revlog: manifest tick_end %s does not match path tick end %s",
+			m.TickEnd, tickEnd)
+	}
+	return m, nil
+}
+
+// OpenTick loads one closed tick by its end time: GET the marker,
+// verify it, and return a Tick suitable for GetTickReader. This is the
+// natural entry point when the caller already knows which tick to read
+// (e.g. CDC advancing tick-by-tick) without listing resolved/.
+func (lr *S3LogReader) OpenTick(ctx context.Context, tickEnd hlc.Timestamp) (Tick, error) {
+	m, err := ReadTickManifest(ctx, lr.es, tickEnd)
+	if err != nil {
+		return Tick{}, err
+	}
+	return Tick{TickStart: m.TickStart, TickEnd: tickEnd, Manifest: m}, nil
+}
+
+// NewS3TickReader returns a TickReader backed by external storage for
+// one tick's data files. Pass spans from the changefeed scope, or nil
+// for all keys in the tick.
+func NewS3TickReader(es cloud.ExternalStorage, t Tick, spans []roachpb.Span) *S3TickReader {
+	return &S3TickReader{es: es, tick: t, spans: spans}
+}
+
+// GetTickReader implements LogReader. Opens one tick for iteration.
+// The reader emits events whose user_keys fall in any of the
+// requested spans. If spans is empty, all events in the tick are
+// emitted.
 //
 // Spans must be sorted by start key and non-overlapping; the iterator
 // advances through them in order. The caller retains ownership of
 // the slice.
-func (lr *LogReader) GetTickReader(ctx context.Context, t Tick, spans []roachpb.Span) *TickReader {
-	return &TickReader{
-		es:    lr.es,
-		tick:  t,
-		spans: spans,
-	}
+func (lr *S3LogReader) GetTickReader(ctx context.Context, t Tick, spans []roachpb.Span) TickReader {
+	_ = ctx // reserved for future options
+	return NewS3TickReader(lr.es, t, spans)
+}
+
+// CoveredSpans implements LogReader. For now returns all requested
+// spans — the S3 reader does not yet consult the coverage manifest.
+// TODO(sachin): read log/coverage/ entries to filter uncovered spans.
+func (lr *S3LogReader) CoveredSpans(
+	_ context.Context, _ Tick, spans []roachpb.Span,
+) []roachpb.Span {
+	return spans
+}
+
+// LatestResolved implements LogReader. Returns the TickEnd of the
+// most recently closed tick by listing log/resolved/.
+// TODO(sachin): implement properly — for now returns zero.
+func (lr *S3LogReader) LatestResolved(_ context.Context) (hlc.Timestamp, error) {
+	return hlc.Timestamp{}, nil
+}
+
+// TickEvents returns an iterator over one tick's events, filtered by
+// spans. This is a convenience that chains GetTickReader and Events,
+// suitable for callers who need an iter.Seq2 without holding the
+// intermediate TickReader handle.
+func (lr *S3LogReader) TickEvents(
+	ctx context.Context, t Tick, spans []roachpb.Span,
+) iter.Seq2[Event, error] {
+	return lr.GetTickReader(ctx, t, spans).Events(ctx)
 }
 
 // Event is a decoded change emitted by a TickReader.
@@ -218,12 +292,32 @@ type Event struct {
 	PrevValue roachpb.Value // zero-value if no diff
 }
 
-// TickReader iterates events in one tick, in per-key revision order,
-// restricted to the configured spans.
-type TickReader struct {
+// S3TickReader iterates events in one tick from external storage, in
+// per-key revision order (format §7), restricted to the configured
+// spans. Implements the TickReader interface.
+type S3TickReader struct {
 	es    cloud.ExternalStorage
 	tick  Tick
 	spans []roachpb.Span
+}
+
+// DataFilePaths returns log/data/<tick-end>/<file_id>.sst paths in
+// read order (ascending flush_order, stable by manifest order on ties).
+// Use this to prefetch or inspect objects before decoding; event
+// iteration is S3TickReader.Events.
+func DataFilePaths(tickEnd hlc.Timestamp, m *revlogpb.Manifest) []string {
+	if m == nil {
+		return nil
+	}
+	files := slices.Clone(m.Files)
+	slices.SortStableFunc(files, func(a, b revlogpb.File) int {
+		return int(a.FlushOrder) - int(b.FlushOrder)
+	})
+	out := make([]string, 0, len(files))
+	for _, f := range files {
+		out = append(out, DataFilePath(tickEnd, f.FileID))
+	}
+	return out
 }
 
 // Events iterates events in the tick. Files are processed in
@@ -235,7 +329,7 @@ type TickReader struct {
 //
 // If reading or decoding any file fails, iteration stops and the
 // error is yielded once.
-func (tr *TickReader) Events(ctx context.Context) iter.Seq2[Event, error] {
+func (tr *S3TickReader) Events(ctx context.Context) iter.Seq2[Event, error] {
 	return func(yield func(Event, error) bool) {
 		// Stable-sort the manifest's files by flush_order. Stable so
 		// ties preserve manifest order, matching the spec's "any
@@ -258,10 +352,10 @@ func (tr *TickReader) Events(ctx context.Context) iter.Seq2[Event, error] {
 // Returns an error only on a hard failure (read, parse, or decode);
 // returning nil with the iteration cut short by yield returning false
 // is the "consumer stopped" path.
-func (tr *TickReader) emitFile(
+func (tr *S3TickReader) emitFile(
 	ctx context.Context, f revlogpb.File, yield func(Event, error) bool,
 ) error {
-	name := DataFilePath(tr.tick.EndTime, f.FileID)
+	name := DataFilePath(tr.tick.TickEnd, f.FileID)
 	rc, sz, err := tr.es.ReadFile(ctx, name, cloud.ReadOptions{})
 	if err != nil {
 		return errors.Wrapf(err, "opening %s", name)
@@ -344,7 +438,7 @@ func (tr *TickReader) emitFile(
 
 // readManifest downloads, verifies, and decodes a tick manifest at
 // the given object name. The marker layout is a 4-byte little-endian
-// CRC32C followed by the marshaled Manifest proto.
+// CRC32C followed by the marshaled Manifest proto (format §4).
 func readManifest(
 	ctx context.Context, es cloud.ExternalStorage, name string,
 ) (revlogpb.Manifest, error) {

@@ -20,10 +20,6 @@ import (
 	"github.com/cockroachdb/pebble/sstable"
 )
 
-// crc32cTable is the Castagnoli polynomial table used for the trailing
-// checksum of manifest objects.
-var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
-
 // TickWriter writes one data file in a tick. It opens an SSTable
 // stream into external storage at log/data/<tick-end>/<file_id>.sst
 // and accepts entries via Add in strictly ascending

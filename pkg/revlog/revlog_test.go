@@ -88,7 +88,7 @@ func sealTick(
 // collectTicks drains a Ticks iterator into a slice. Any error stops
 // iteration and is returned.
 func collectTicks(
-	t *testing.T, lr *revlog.LogReader, ctx context.Context, start, end hlc.Timestamp,
+	t *testing.T, lr *revlog.S3LogReader, ctx context.Context, start, end hlc.Timestamp,
 ) []revlog.Tick {
 	t.Helper()
 	var out []revlog.Tick
@@ -100,7 +100,7 @@ func collectTicks(
 }
 
 // collectEvents drains a TickReader.Events iterator into a slice.
-func collectEvents(t *testing.T, tr *revlog.TickReader, ctx context.Context) []revlog.Event {
+func collectEvents(t *testing.T, tr revlog.TickReader, ctx context.Context) []revlog.Event {
 	t.Helper()
 	var out []revlog.Event
 	for ev, err := range tr.Events(ctx) {
@@ -165,7 +165,7 @@ func TestRoundTripSingleFile(t *testing.T) {
 	lr := revlog.NewLogReader(es)
 	ticks := collectTicks(t, lr, ctx, te.Prev(), te)
 	require.Len(t, ticks, 1)
-	require.Equal(t, te, ticks[0].EndTime)
+	require.Equal(t, te, ticks[0].TickEnd)
 	require.Len(t, ticks[0].Manifest.Files, 1)
 
 	got := collectEvents(t, lr.GetTickReader(ctx, ticks[0], nil), ctx)
@@ -206,7 +206,7 @@ func TestCoverageOverlap(t *testing.T) {
 	q22 := hlc.Timestamp{WallTime: time.Date(2026, 4, 20, 15, 30, 22, 0, time.UTC).UnixNano()}
 	got := collectTicks(t, lr, ctx, q8, q22)
 	require.Equal(t, []hlc.Timestamp{t10, t20, t30},
-		[]hlc.Timestamp{got[0].EndTime, got[1].EndTime, got[2].EndTime},
+		[]hlc.Timestamp{got[0].TickEnd, got[1].TickEnd, got[2].TickEnd},
 		"expected t10..t30 to overlap (q8, q22]; t40 must not")
 	require.Len(t, got, 3)
 
@@ -214,7 +214,7 @@ func TestCoverageOverlap(t *testing.T) {
 	// returns just that one tick — its coverage *is* the window.
 	got = collectTicks(t, lr, ctx, t10, t20)
 	require.Len(t, got, 1)
-	require.Equal(t, t20, got[0].EndTime)
+	require.Equal(t, t20, got[0].TickEnd)
 }
 
 // TestExplicitTickStart verifies the mid-tick log launch case:
@@ -257,7 +257,7 @@ func TestExplicitTickStart(t *testing.T) {
 	q8 := hlc.Timestamp{WallTime: time.Date(2026, 4, 20, 15, 30, 8, 0, time.UTC).UnixNano()}
 	got := collectTicks(t, lr, ctx, q5, q8)
 	require.Len(t, got, 1)
-	require.Equal(t, te, got[0].EndTime)
+	require.Equal(t, te, got[0].TickEnd)
 	require.Equal(t, tickStart, got[0].Manifest.TickStart)
 
 	// Window (15:30:00, 15:30:06] is entirely before the tick's
@@ -294,18 +294,18 @@ func TestEnumerationAcrossHours(t *testing.T) {
 	all := collectTicks(t, lr, ctx, t1.Prev(), t4)
 	require.Len(t, all, 4)
 	require.Equal(t, []hlc.Timestamp{t1, t2, t3, t4},
-		[]hlc.Timestamp{all[0].EndTime, all[1].EndTime, all[2].EndTime, all[3].EndTime})
+		[]hlc.Timestamp{all[0].TickEnd, all[1].TickEnd, all[2].TickEnd, all[3].TickEnd})
 
 	// Half-open semantics: (t1, t3] returns t2 and t3 (not t1).
 	mid := collectTicks(t, lr, ctx, t1, t3)
 	require.Len(t, mid, 2)
-	require.Equal(t, t2, mid[0].EndTime)
-	require.Equal(t, t3, mid[1].EndTime)
+	require.Equal(t, t2, mid[0].TickEnd)
+	require.Equal(t, t3, mid[1].TickEnd)
 
 	// (t1.Prev, t1] returns just t1.
 	just1 := collectTicks(t, lr, ctx, t1.Prev(), t1)
 	require.Len(t, just1, 1)
-	require.Equal(t, t1, just1[0].EndTime)
+	require.Equal(t, t1, just1[0].TickEnd)
 
 	// Window with no ticks: empty.
 	empty := collectTicks(t, lr, ctx,

@@ -24,7 +24,6 @@ go_test(
         "//pkg/kv/kvclient/kvcoord",
         "//pkg/kv/kvpb",
         "//pkg/revlog",
-        "//pkg/revlog/revlogpb",
         "//pkg/roachpb",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",

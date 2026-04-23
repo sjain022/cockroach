@@ -4,6 +4,8 @@ go_library(
     name = "revlog",
     srcs = [
         "encoding.go",
+        "framing.go",
+        "interfaces.go",
         "paths.go",
         "reader.go",
         "revlog.go",
@@ -28,9 +30,14 @@ go_library(
 
 go_test(
     name = "revlog_test",
-    srcs = ["revlog_test.go"],
+    srcs = [
+        "framing_test.go",
+        "gen_testdata_test.go",
+        "revlog_test.go",
+        "test_reader_test.go",
+    ],
+    embed = [":revlog"],
     deps = [
-        ":revlog",
         "//pkg/cloud",
         "//pkg/cloud/cloudpb",
         "//pkg/cloud/nodelocal",

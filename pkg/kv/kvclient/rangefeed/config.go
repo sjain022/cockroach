@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/revlog"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -50,6 +51,7 @@ type config struct {
 	onDeleteRange         OnDeleteRange
 	onMetadata            OnMetadata
 	extraPProfLabels      []string
+	revlogReader          revlog.LogReader
 }
 
 type scanConfig struct {
@@ -294,6 +296,17 @@ type FrontierSpanVisitor func(ctx context.Context, advanced bool, frontier Visit
 func WithFrontierSpanVisitor(fn FrontierSpanVisitor) Option {
 	return optionFunc(func(c *config) {
 		c.frontierVisitor = fn
+	})
+}
+
+// WithRevlogReader configures the rangefeed to serve its catch-up
+// phase from the given revlog reader instead of from KV's MVCC
+// history. The rangefeed replays closed ticks from the revlog until
+// the frontier is close to the present, then hands off to a live KV
+// rangefeed for the remaining gap and ongoing events.
+func WithRevlogReader(reader revlog.LogReader) Option {
+	return optionFunc(func(c *config) {
+		c.revlogReader = reader
 	})
 }
 
