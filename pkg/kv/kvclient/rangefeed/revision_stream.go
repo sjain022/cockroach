@@ -22,28 +22,12 @@ import (
 
 // revisionStreamHandoffThreshold controls how close the frontier must
 // be to the current wall clock before the revision stream catch-up
-// hands off to a live KV rangefeed. Zero means replay whatever ticks
-// are available and hand off immediately without waiting for more.
+// hands off to the inner rangefeed.
 var revisionStreamHandoffThreshold = 30 * time.Second
 
 // revisionStreamDB wraps a rangefeed.DB, serving the catch-up phase
 // from a revision stream (continuous backup log) before handing off
 // to the inner DB for live events.
-//
-// On each call to RangeFeed or RangeFeedFromFrontier, the wrapper
-// checks whether the start timestamp is far enough behind the
-// present that replaying from the revision stream would be cheaper
-// than a KV catch-up scan. If so, it reads closed ticks from the
-// log and writes the events as RangeFeedValue and RangeFeedCheckpoint
-// messages to eventC — the same channel that processEvents reads
-// from. Once the frontier is within defaultHandoffThreshold of the
-// current time, it delegates to the inner DB for the remaining
-// catch-up and live events.
-//
-// On retry (after a transient failure in the KV rangefeed), run()
-// re-reads the frontier and calls RangeFeed again. If the frontier
-// is already past the log's resolved time, the wrapper passes
-// through to the inner DB immediately — replay doesn't re-run.
 type revisionStreamDB struct {
 	inner  DB
 	reader revlog.LogReader
@@ -53,10 +37,7 @@ func newRevisionStreamDB(inner DB, reader revlog.LogReader) *revisionStreamDB {
 	return &revisionStreamDB{inner: inner, reader: reader}
 }
 
-// RangeFeed implements DB. Replays closed ticks from the revision
-// stream into a local frontier with per-span granularity, then
-// hands off to the inner DB via RangeFeedFromFrontier so KV only
-// catches up the remaining gap for each span.
+// RangeFeed implements DB.
 func (rs *revisionStreamDB) RangeFeed(
 	ctx context.Context,
 	spans []roachpb.Span,
@@ -64,6 +45,10 @@ func (rs *revisionStreamDB) RangeFeed(
 	eventC chan<- kvcoord.RangeFeedMessage,
 	opts ...kvcoord.RangeFeedOption,
 ) error {
+	// We create a frontier with all spans starting at `startFrom`
+	// to pass to replayLog. This way the inner rangefeed gets per
+	// span granularity in the case we have missing spans in our
+	// coverage.
 	frontier, err := span.MakeFrontier(spans...)
 	if err != nil {
 		return err
@@ -73,6 +58,10 @@ func (rs *revisionStreamDB) RangeFeed(
 			return err
 		}
 	}
+
+	// Because we don't have an asynchronous consumer of
+	// events advancing the frontier like in RangeFeedFromFrontier,
+	// we must advance the frontier ourselves.
 	onCheckpoint := func(sp roachpb.Span, ts hlc.Timestamp) {
 		_, _ = frontier.Forward(sp, ts)
 	}
@@ -82,11 +71,7 @@ func (rs *revisionStreamDB) RangeFeed(
 	return rs.inner.RangeFeedFromFrontier(ctx, frontier, eventC, opts...)
 }
 
-// RangeFeedFromFrontier implements DB. Replays closed ticks from
-// the revision stream, then delegates to the inner DB. The shared
-// frontier is advanced by processEvents consuming the checkpoints
-// emitted during replay, so replayLog does not need to track
-// per-span progress itself.
+// RangeFeedFromFrontier implements DB.
 func (rs *revisionStreamDB) RangeFeedFromFrontier(
 	ctx context.Context,
 	frontier span.Frontier,
@@ -100,11 +85,14 @@ func (rs *revisionStreamDB) RangeFeedFromFrontier(
 	if err := rs.replayLog(ctx, spans, frontier.Frontier(), eventC, nil); err != nil {
 		return err
 	}
+
+	// TODO(darryl): think about if it's possible processEvent races with
+	// the set up of the inner rangefeed, i.e. we started the inner rangefeed
+	// at a state before we've processed the last tick and advanced the frontier. May need a wait here to avoid that.
 	return rs.inner.RangeFeedFromFrontier(ctx, frontier, eventC, opts...)
 }
 
-// Scan implements DB. Passes through — the revision stream is a
-// change log, not a point-in-time snapshot.
+// Scan implements DB.
 func (rs *revisionStreamDB) Scan(
 	ctx context.Context,
 	spans []roachpb.Span,
@@ -119,34 +107,6 @@ func (rs *revisionStreamDB) Scan(
 // replayLog replays closed ticks from the revision stream into
 // eventC. Spans not covered by the revision stream (or that lose
 // coverage mid-replay) are left for KV to catch up.
-//
-// onCheckpoint, if non-nil, is called for each span at each tick's
-// end timestamp after the checkpoint is emitted to eventC. The
-// RangeFeed path uses this to advance a local frontier with
-// per-span granularity; the RangeFeedFromFrontier path passes nil
-// because processEvents already advances the shared frontier from
-// eventC.
-//
-// Algorithm:
-//  1. Check if the cursor (initially startFrom) is within
-//     revisionStreamHandoffThreshold of the wall clock. If so,
-//     return — KV handles the rest.
-//  2. Snapshot "now" and call Ticks(ctx, cursor, now) to iterate
-//     all closed ticks from cursor to the present.
-//  3. For each tick:
-//     a. Call CoveredSpans to narrow the watched span set to those
-//     covered by the revision stream. Uncovered spans are
-//     permanently dropped — KV catches them up. The set can
-//     only shrink over time (new coverage epoch).
-//     b. Open one GetTickReader with the watched spans. Emit all
-//     events as RangeFeedValue messages on eventC. Events for
-//     spans whose frontier is ahead of TickStart are harmless
-//     — processEvents drops them.
-//     c. Emit a RangeFeedCheckpoint per watched span at TickEnd.
-//     processEvents advances the frontier from these.
-//  4. Set cursor to "now" and loop back to step 1. Time has
-//     passed while replaying, so new ticks may have closed. The
-//     loop exits when the cursor is within the threshold.
 func (rs *revisionStreamDB) replayLog(
 	ctx context.Context,
 	spans []roachpb.Span,
@@ -163,6 +123,9 @@ func (rs *revisionStreamDB) replayLog(
 		// this in between each tick. Catching up too much is fine, we want
 		// to avoid the reverse where we don't catch up enough and have to
 		// read old MVCC history from kv.
+		//
+		// TODO(darryl) If revisionStreamHandoffThreshold ends up being on the order of
+		// magnitude of minutes, maybe we consider doing (now - delta)
 		if timeutil.Since(cursor.GoTime()) <= revisionStreamHandoffThreshold {
 			return nil
 		}
@@ -193,6 +156,13 @@ func (rs *revisionStreamDB) replayLog(
 				return err
 			}
 			cursor = tick.EndTime
+		}
+		// If the cursor didn't yield a tick that includes now (i.e. we hit an unclosed tick), then it must be:
+		//  1. We are close enough to the current time (and the threshold) that the revlog is still catching up.
+		//  2. The revlog is lagging behind.
+		// In either case we want to hand off to the inner rangefeed.
+		if cursor.Less(now) {
+			return nil
 		}
 	}
 }

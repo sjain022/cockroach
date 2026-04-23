@@ -200,10 +200,10 @@ func (p *ptsManager) advance(ctx context.Context, frontier hlc.Timestamp) {
 		return
 	}
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	// Only move recordTS forward, in case a concurrent advance racing
 	// with us already wrote a larger value.
 	if p.mu.recordTS.Less(candidate) {
 		p.mu.recordTS = candidate
 	}
-	p.mu.Unlock()
 }

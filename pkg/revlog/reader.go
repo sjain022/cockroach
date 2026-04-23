@@ -191,13 +191,6 @@ func commonStringPrefix(a, b string) string {
 	return a[:n]
 }
 
-// GetTickReader opens one tick for iteration. The reader emits events
-// whose user_keys fall in any of the requested spans. If spans is
-// empty, all events in the tick are emitted.
-//
-// Spans must be sorted by start key and non-overlapping; the iterator
-// advances through them in order. The caller retains ownership of
-// the slice.
 // CoveredSpans returns the subset of the given spans that are covered
 // by the revision stream at the given tick. Delegates to CoverageAt
 // to find the active coverage epoch; if no coverage exists, all
