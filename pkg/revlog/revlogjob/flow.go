@@ -7,11 +7,15 @@ package revlogjob
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
+	"github.com/cockroachdb/cockroach/pkg/revlog"
+	"github.com/cockroachdb/cockroach/pkg/revlog/revlogpb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -23,31 +27,33 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// Run plans and executes the revlog DistSQL flow. The (current) span
-// set returned by resolveSpans is partitioned across SQL instances
-// via dsp.PartitionSpans (the same primitive backup uses), and one
-// producer processor is planned on each instance that received any
-// spans, watching only its assigned subset. Per-flush metadata
-// streams back to the gateway, where this function decodes each
-// entry and routes it to a TickManager that aggregates checkpoints
-// across the union of all producer subsets and writes manifests as
-// each tick's frontier crosses its end.
+// Run plans and executes the revlog DistSQL flow. The current
+// span set is obtained from scope.Spans, partitioned across SQL
+// instances via dsp.PartitionSpans (the same primitive backup
+// uses), and one producer processor is planned on each instance
+// that received any spans, watching only its assigned subset.
+// Per-flush metadata streams back to the gateway, where this
+// function decodes each entry and routes it to a TickManager that
+// aggregates checkpoints across the union of all producer subsets
+// and writes manifests as each tick's frontier crosses its end.
 //
-// resolveSpans is the seam for backup-side scope logic: Run calls it
-// once at startup (with changedDescIDs=nil) to learn the initial
-// span set, and a future descriptor-rangefeed-driven coordinator
-// will re-call it on each schema change. See SpanResolver.
+// scope is the seam for backup-side scope logic — see Scope.
+// Run calls scope.Spans once at startup to learn the initial span
+// set; a future descriptor-rangefeed-driven coordinator will
+// re-call it (and consult scope.Matches / scope.Terminated) on
+// each schema change.
 //
 // ptsTarget describes the keyspace covered by the writer's
 // self-managed protected timestamp record (see pts.go). It is the
 // caller's responsibility to construct a target that matches the
-// resolveSpans coverage; revlogjob does not derive one because the
+// scope coverage; revlogjob does not derive one because the
 // codec/tenant context lives outside this package.
 //
 // v1 simplifications:
 //
-//   - resolveSpans is invoked exactly once at startup; mid-job
-//     coverage changes are TODO.
+//   - scope.Spans is invoked exactly once at startup; mid-job
+//     coverage changes (driven by scope.Matches via the descriptor
+//     rangefeed) are TODO.
 //   - startHLC, dest, and tickWidth come from the caller. A real
 //     backup-job resumer would derive these from BackupDetails
 //     (TODO).
@@ -64,21 +70,21 @@ func Run(
 	ctx context.Context,
 	execCtx sql.JobExecContext,
 	jobID jobspb.JobID,
-	resolveSpans DescSpanResolver,
+	scope Scope,
 	startHLC hlc.Timestamp,
 	dest string,
 	tickWidth time.Duration,
 	ptsTarget *ptpb.Target,
 ) error {
-	if resolveSpans == nil {
-		return errors.AssertionFailedf("revlogjob.Run: resolveSpans must be non-nil")
+	if scope == nil {
+		return errors.AssertionFailedf("revlogjob.Run: scope must be non-nil")
 	}
-	spans, err := resolveSpans(ctx, startHLC, nil /* changedDescIDs */)
+	spans, err := scope.Spans(ctx, startHLC)
 	if err != nil {
 		return errors.Wrap(err, "resolving initial span set")
 	}
 	if len(spans) == 0 {
-		return errors.AssertionFailedf("revlogjob.Run: resolveSpans returned no spans")
+		return errors.AssertionFailedf("revlogjob.Run: scope.Spans returned no spans")
 	}
 
 	// The gateway-side TickManager writes manifests as the
@@ -97,6 +103,13 @@ func Run(
 	manager, err := NewTickManager(es, spans, startHLC, tickWidth)
 	if err != nil {
 		return err
+	}
+
+	// One coverage entry effective at startHLC so readers can
+	// resolve "what was watched at T?" for any T >= startHLC even
+	// before any descriptor change writes an incremental entry.
+	if err := writeInitialCoverage(ctx, es, scope, spans, startHLC); err != nil {
+		return errors.Wrap(err, "writing initial coverage manifest")
 	}
 
 	// Load the job record so the PTS manager (below) can persist
@@ -157,9 +170,40 @@ func Run(
 		<-checkpointDone
 	}()
 
+	// Start the descriptor rangefeed. Without it the TickManager
+	// close loop never advances past startHLC. ErrScopeTerminated
+	// means the scope dissolved and the writer should exit
+	// successfully; we cancel flowCtx to wind down everything else
+	// and the terminatedCleanly flag tells the final return to
+	// report success instead of context.Canceled.
+	flowCtx, cancelFlow := context.WithCancel(ctx)
+	var terminatedCleanly atomic.Bool
+	descDone := make(chan struct{})
+	go func() {
+		defer close(descDone)
+		err := runDescFeed(
+			flowCtx, execCtx.ExecCfg().RangeFeedFactory, execCtx.ExecCfg().Codec,
+			scope, manager, es, startHLC, spans,
+		)
+		switch {
+		case err == nil, errors.Is(err, context.Canceled):
+			// Normal shutdown.
+		case errors.Is(err, ErrScopeTerminated):
+			log.Dev.Infof(ctx, "revlogjob: scope terminated, exiting cleanly")
+			terminatedCleanly.Store(true)
+			cancelFlow()
+		default:
+			log.Dev.Warningf(ctx, "revlogjob: descfeed exited with error: %v", err)
+		}
+	}()
+	defer func() {
+		cancelFlow()
+		<-descDone
+	}()
+
 	dsp := execCtx.DistSQLPlanner()
 	planCtx, _, err := dsp.SetupAllNodesPlanning(
-		ctx, execCtx.ExtendedEvalContext(), execCtx.ExecCfg(),
+		flowCtx, execCtx.ExtendedEvalContext(), execCtx.ExecCfg(),
 	)
 	if err != nil {
 		return err
@@ -170,7 +214,7 @@ func Run(
 	// subset. PartitionSpans returns one entry per instance that
 	// received any spans, so instances with no leaseholders for any
 	// of these spans get no producer.
-	partitions, err := dsp.PartitionSpans(ctx, planCtx, spans, sql.PartitionSpansBoundDefault)
+	partitions, err := dsp.PartitionSpans(flowCtx, planCtx, spans, sql.PartitionSpansBoundDefault)
 	if err != nil {
 		return errors.Wrap(err, "partitioning spans across producers")
 	}
@@ -207,7 +251,7 @@ func Run(
 		corePlacement, execinfrapb.PostProcessSpec{}, []*types.T{},
 		execinfrapb.Ordering{}, nil, /* finalizeLastStageCb */
 	)
-	sql.FinalizePlan(ctx, planCtx, plan)
+	sql.FinalizePlan(flowCtx, planCtx, plan)
 
 	res := sql.NewMetadataOnlyMetadataCallbackWriter(
 		func(ctx context.Context, meta *execinfrapb.ProducerMetadata) error {
@@ -215,7 +259,7 @@ func Run(
 		},
 	)
 	recv := sql.MakeDistSQLReceiver(
-		ctx, res, tree.Ack,
+		flowCtx, res, tree.Ack,
 		nil, /* rangeCache */
 		nil, /* txn */
 		nil, /* clockUpdater */
@@ -224,8 +268,36 @@ func Run(
 	defer recv.Release()
 
 	evalCtxCopy := execCtx.ExtendedEvalContext().Context.Copy()
-	dsp.Run(ctx, planCtx, nil /* txn */, plan, recv, evalCtxCopy, nil /* finishedSetupFn */)
-	return res.Err()
+	dsp.Run(flowCtx, planCtx, nil /* txn */, plan, recv, evalCtxCopy, nil /* finishedSetupFn */)
+	if err := res.Err(); err != nil {
+		// If we cancelled the flow because the scope terminated,
+		// the resulting context.Canceled isn't a failure — the
+		// writer's outer loop is supposed to exit successfully.
+		if terminatedCleanly.Load() && errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// writeInitialCoverage writes one log/coverage/<startHLC> entry
+// describing the scope's resolved span set at job startup. On
+// resume the same-HLC entry is overwritten with the same content
+// (or rejected by WORM-strict storage; either way the persisted
+// state stays correct).
+func writeInitialCoverage(
+	ctx context.Context,
+	es cloud.ExternalStorage,
+	scope Scope,
+	spans []roachpb.Span,
+	startHLC hlc.Timestamp,
+) error {
+	return revlog.WriteCoverage(ctx, es, revlogpb.Coverage{
+		EffectiveFrom: startHLC,
+		Scope:         scope.String(),
+		Spans:         spans,
+	})
 }
 
 // handleProducerMetadata routes one ProducerMetadata into the
