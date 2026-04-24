@@ -7,23 +7,29 @@ package revlogjob
 
 import (
 	"context"
+	"fmt"
 	"iter"
 	"math"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/revlog"
+	"github.com/cockroachdb/cockroach/pkg/revlog/revlogpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 )
@@ -54,6 +60,175 @@ func init() {
 			makeRevlogChangesOverload(false /* withBounds */, true /* raw */),
 		},
 	)
+
+	// crdb_internal.revlog_synth_coverage writes a coverage manifest
+	// covering a single span.
+	builtinsregistry.Register("crdb_internal.revlog_synth_coverage",
+		&tree.FunctionProperties{
+			Category:         "Revlog",
+			DistsqlBlocklist: true,
+		},
+		[]tree.Overload{makeRevlogSynthCoverageOverload()},
+	)
+
+	// crdb_internal.revlog_synth_tick_with_kv writes a tick with N
+	// real value events alongside its manifest.
+	builtinsregistry.Register("crdb_internal.revlog_synth_tick_with_kv",
+		&tree.FunctionProperties{
+			Category:         "Revlog",
+			DistsqlBlocklist: true,
+		},
+		[]tree.Overload{makeRevlogSynthTickWithKVOverload()},
+	)
+}
+
+func makeRevlogSynthCoverageOverload() tree.Overload {
+	return tree.Overload{
+		Types: tree.ParamTypes{
+			{Name: "collection", Typ: types.String},
+			{Name: "effective_from", Typ: types.TimestampTZ},
+			{Name: "table_id", Typ: types.Int},
+		},
+		ReturnType: tree.FixedReturnType(types.Bool),
+		Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+			if err := evalCtx.SessionAccessor.CheckPrivilege(
+				ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER,
+			); err != nil {
+				return nil, err
+			}
+			uri := string(tree.MustBeDString(args[0]))
+			effectiveFrom := hlc.Timestamp{WallTime: tree.MustBeDTimestampTZ(args[1]).Time.UnixNano()}
+			tableID := uint32(tree.MustBeDInt(args[2]))
+			cfg := evalCtx.Planner.ExecutorConfig().(*sql.ExecutorConfig)
+			tablePrefix := cfg.Codec.TablePrefix(tableID)
+			coverage := revlogpb.Coverage{
+				EffectiveFrom: effectiveFrom,
+				Spans:         []roachpb.Span{{Key: tablePrefix, EndKey: tablePrefix.PrefixEnd()}},
+			}
+			es, err := openRevlogStorage(ctx, evalCtx, uri)
+			if err != nil {
+				return nil, err
+			}
+			defer func() { _ = es.Close() }()
+			if err := revlog.WriteCoverage(ctx, es, coverage); err != nil {
+				return nil, errors.Wrap(err, "writing synthetic coverage manifest")
+			}
+			return tree.DBoolTrue, nil
+		},
+		Info:       "Write a coverage manifest covering the given table's full key range, effective from the given HLC. Test helper.",
+		Volatility: volatility.Volatile,
+	}
+}
+
+// makeRevlogSynthTickWithKVOverload returns a builtin overload that writes a
+// closed tick with `num_events` real value events. Events have the on-disk
+// encoding of inserts into a kv-workload-style table:
+//
+//   - One INT primary key column (column ID 1, ascending).
+//   - One BYTES value column (column ID 2) in the default column family
+//     (family ID 0).
+//
+// Generated rows have keys k = key_offset, key_offset+1, ...,
+// MVCC timestamps are distributed evenly.
+func makeRevlogSynthTickWithKVOverload() tree.Overload {
+	return tree.Overload{
+		Types: tree.ParamTypes{
+			{Name: "collection", Typ: types.String},
+			{Name: "tick_start", Typ: types.TimestampTZ},
+			{Name: "tick_end", Typ: types.TimestampTZ},
+			{Name: "table_id", Typ: types.Int},
+			{Name: "num_events", Typ: types.Int},
+			{Name: "key_offset", Typ: types.Int},
+		},
+		ReturnType: tree.FixedReturnType(types.Bool),
+		Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+			if err := evalCtx.SessionAccessor.CheckPrivilege(
+				ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER,
+			); err != nil {
+				return nil, err
+			}
+			uri := string(tree.MustBeDString(args[0]))
+			tickStart := hlc.Timestamp{WallTime: tree.MustBeDTimestampTZ(args[1]).Time.UnixNano()}
+			tickEnd := hlc.Timestamp{WallTime: tree.MustBeDTimestampTZ(args[2]).Time.UnixNano()}
+			tableID := uint32(tree.MustBeDInt(args[3]))
+			numEvents := int(tree.MustBeDInt(args[4]))
+			keyOffset := int64(tree.MustBeDInt(args[5]))
+
+			if numEvents <= 0 {
+				return nil, errors.New("num_events must be > 0; for empty ticks use revlog_synth_tick")
+			}
+
+			cfg := evalCtx.Planner.ExecutorConfig().(*sql.ExecutorConfig)
+			es, err := openRevlogStorage(ctx, evalCtx, uri)
+			if err != nil {
+				return nil, err
+			}
+			defer func() { _ = es.Close() }()
+
+			// Open one data file for this tick. file_id is derived from the tick
+			// boundary so repeated calls overwrite rather than collide; flush_order
+			// is 0 (single producer per tick in this test path).
+			fileID := tickEnd.WallTime
+			tw, err := revlog.NewTickWriter(ctx, es, tickEnd, fileID, 0 /* flushOrder */)
+			if err != nil {
+				return nil, errors.Wrap(err, "opening tick writer")
+			}
+
+			// Pre-build the index prefix for the primary index (index ID 1).
+			indexPrefix := cfg.Codec.IndexPrefix(tableID, 1)
+
+			// Distribute events evenly within (tick_start, tick_end].
+			windowNanos := tickEnd.WallTime - tickStart.WallTime
+			for i := 0; i < numEvents; i++ {
+				k := keyOffset + int64(i)
+
+				keyBytes := append([]byte(nil), indexPrefix...)
+				keyBytes, err = keyside.Encode(keyBytes, tree.NewDInt(tree.DInt(k)), encoding.Ascending)
+				if err != nil {
+					_, _, _ = tw.Close()
+					return nil, errors.Wrap(err, "encoding primary key")
+				}
+				keyBytes = keys.MakeFamilyKey(keyBytes, 0)
+
+				// Encode the value: tuple-encoded with column ID 2 (delta from 0).
+				vDatum := tree.NewDBytes(tree.DBytes(fmt.Sprintf("synth-%d", i)))
+				var colBytes []byte
+				colBytes, err = valueside.Encode(colBytes, valueside.MakeColumnIDDelta(0, 2), vDatum)
+				if err != nil {
+					_, _, _ = tw.Close()
+					return nil, errors.Wrap(err, "encoding value column")
+				}
+				var rval roachpb.Value
+				rval.SetTuple(colBytes)
+
+				// MVCC timestamp evenly distributed in (tick_start, tick_end].
+				offsetNanos := int64(i+1) * windowNanos / int64(numEvents+1)
+				ts := hlc.Timestamp{WallTime: tickStart.WallTime + offsetNanos}
+
+				if err := tw.Add(roachpb.Key(keyBytes), ts, rval.RawBytes, nil /* prevValue */); err != nil {
+					_, _, _ = tw.Close()
+					return nil, errors.Wrap(err, "adding event")
+				}
+			}
+
+			file, _, err := tw.Close()
+			if err != nil {
+				return nil, errors.Wrap(err, "closing tick writer")
+			}
+			if err := revlog.WriteTickManifest(ctx, es, revlogpb.Manifest{
+				TickStart: tickStart,
+				TickEnd:   tickEnd,
+				Files:     []revlogpb.File{file},
+			}); err != nil {
+				return nil, errors.Wrap(err, "writing tick manifest")
+			}
+			return tree.DBoolTrue, nil
+		},
+		Info: "Write a closed tick containing num_events synthetic INSERT-like events for a kv-workload-style table " +
+			"(INT primary key column 1, BYTES value column 2, family 0). Keys are key_offset..key_offset+num_events-1. " +
+			"Test helper.",
+		Volatility: volatility.Volatile,
+	}
 }
 
 var revlogTicksType = types.MakeLabeledTuple(

@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/revlog"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -97,6 +98,13 @@ type Config struct {
 	ScopedTimers *timers.ScopedTimers
 
 	ConsumerID int64
+
+	// RevisionStreamReader, when non-nil, makes the rangefeed catch-up
+	// phase replay closed ticks from a continuous-backup revision stream
+	// before handing off to the live KV rangefeed. The caller owns the
+	// reader and is responsible for closing the underlying external
+	// storage after kvfeed.Run returns.
+	RevisionStreamReader revlog.LogReader
 }
 
 // Run will run the kvfeed. The feed runs synchronously and returns an
@@ -148,7 +156,8 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 		cfg.InitialHighWater, cfg.InitialSpanTimePairs, cfg.EndTime,
 		cfg.Codec,
 		cfg.SchemaFeed,
-		sc, cfg.RangeFeedFactory, bf, cfg.Targets, cfg.ScopedTimers, cfg.Knobs)
+		sc, cfg.RangeFeedFactory, bf, cfg.Targets, cfg.ScopedTimers, cfg.Knobs,
+		cfg.RevisionStreamReader)
 	f.onBackfillCallback = cfg.MonitoringCfg.OnBackfillCallback
 
 	g.GoCtx(cfg.SchemaFeed.Run)
@@ -240,6 +249,10 @@ type kvFeed struct {
 	tableFeed     schemafeed.SchemaFeed
 	scanner       kvScanner
 	knobs         TestingKnobs
+
+	// revisionStreamReader, when non-nil, is replayed by the physical
+	// feed before opening a live KV rangefeed. See Config.RevisionStreamReader.
+	revisionStreamReader revlog.LogReader
 }
 
 // TODO(yevgeniy): This method is a kitchen sink. Refactor.
@@ -262,6 +275,7 @@ func newKVFeed(
 	targets changefeedbase.Targets,
 	ts *timers.ScopedTimers,
 	knobs TestingKnobs,
+	revisionStreamReader revlog.LogReader,
 ) *kvFeed {
 	return &kvFeed{
 		writer:               writer,
@@ -284,6 +298,7 @@ func newKVFeed(
 		targets:              targets,
 		timers:               ts,
 		knobs:                knobs,
+		revisionStreamReader: revisionStreamReader,
 	}
 }
 
@@ -577,6 +592,7 @@ func (f *kvFeed) runUntilTableEvent(ctx context.Context, resumeFrontier span.Fro
 		ConsumerID:           f.consumerID,
 		Knobs:                f.knobs,
 		Timers:               f.timers,
+		RevisionStreamReader: f.revisionStreamReader,
 	}
 
 	// The following two synchronous calls works as follows:

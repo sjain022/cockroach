@@ -21,6 +21,7 @@ go_library(
         "//pkg/kv/kvclient/kvcoord",
         "//pkg/kv/kvclient/rangefeed",
         "//pkg/kv/kvpb",
+        "//pkg/revlog",
         "//pkg/roachpb",
         "//pkg/rpc/rpcbase",
         "//pkg/settings",

@@ -159,7 +159,7 @@ func TestKVFeed(t *testing.T) {
 			codec,
 			tf, sf, nil /* factory */, bufferFactory,
 			changefeedbase.Targets{},
-			st, TestingKnobs{})
+			st, TestingKnobs{}, nil /* revisionStreamReader */)
 		f.physicalFeedOverride = ref.Run
 		ctx, cancel := context.WithCancel(context.Background())
 		g := ctxgroup.WithContext(ctx)

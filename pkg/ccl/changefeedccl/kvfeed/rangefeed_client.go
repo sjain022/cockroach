@@ -15,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/revlog"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
@@ -32,6 +33,12 @@ type rangeFeedConfig struct {
 	ConsumerID           int64
 	Knobs                TestingKnobs
 	Timers               *timers.ScopedTimers
+
+	// RevisionStreamReader, when non-nil, makes the rangefeed serve the
+	// catch-up phase from a continuous-backup revision stream before
+	// transitioning to the live KV rangefeed. The Factory wraps its
+	// inner DB with revisionStreamDB when this option is set.
+	RevisionStreamReader revlog.LogReader
 }
 
 // quantizeTS returns a new timestamp with the walltime rounded down to the
@@ -191,6 +198,14 @@ func (f *kvFeed) runRangeFeed(ctx context.Context, sink kvevent.Writer, cfg rang
 		rangefeed.WithOnSSTable(rs.onSSTable),
 		rangefeed.WithOnDeleteRange(rs.onDeleteRange),
 		rangefeed.WithOnInternalError(rs.onInternalError),
+	}
+
+	// If a continuous-backup revision stream is configured, hand the reader
+	// to the Factory; Factory.New wraps the inner DB in revisionStreamDB so
+	// the rangefeed serves catch-up from the revlog, then transitions to
+	// live KV automatically once the cursor is within the handoff threshold.
+	if cfg.RevisionStreamReader != nil {
+		opts = append(opts, rangefeed.WithRevisionStream(cfg.RevisionStreamReader))
 	}
 
 	if cfg.Knobs.OnRangeFeedStart != nil {

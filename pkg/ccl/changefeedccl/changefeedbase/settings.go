@@ -510,3 +510,17 @@ var FrontierPersistenceInterval = settings.RegisterDurationSettingWithExplicitUn
 	settings.DurationInRange(5*time.Second, 10*time.Minute),
 	settings.WithPublic,
 )
+
+// RevisionStreamURI optionally points the kvfeed catch-up phase at a
+// continuous-backup revision stream (revlog) at the given external storage
+// URI. When set, the rangefeed serves catch-up by replaying closed ticks
+// from the revlog before handing off to a live KV rangefeed. When empty,
+// catch-up runs against KV's MVCC history as usual. If the URI is set but
+// unreachable, the kvfeed logs a warning and falls back to KV catch-up.
+var RevisionStreamURI = settings.RegisterStringSetting(
+	settings.ApplicationLevel,
+	"changefeed.revision_stream.uri",
+	"external storage URI of a revision stream to serve catch-up from "+
+		"(empty disables; if non-empty but unreachable, falls back to KV catch-up)",
+	"",
+)

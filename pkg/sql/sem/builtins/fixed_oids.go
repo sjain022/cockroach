@@ -2910,6 +2910,8 @@ var builtinOidsArray = []string{
 	2955: `crdb_internal.revlog_show_changes(collection: string, tick_time: timestamptz) -> tuple{string AS key, timestamptz AS mvcc_ts, string AS value, string AS prev_value}`,
 	2956: `crdb_internal.revlog_show_changes(collection: string, tick_time: timestamptz, start_key: bytes, end_key: bytes) -> tuple{string AS key, timestamptz AS mvcc_ts, string AS value, string AS prev_value}`,
 	2957: `crdb_internal.revlog_show_changes(collection: string, tick_time: timestamptz, raw_values: bool) -> tuple{string AS key, timestamptz AS mvcc_ts, bytes AS value, bytes AS prev_value}`,
+	2958: `crdb_internal.revlog_synth_tick_with_kv(collection: string, tick_start: timestamptz, tick_end: timestamptz, table_id: int, num_events: int, key_offset: int) -> bool`,
+	2959: `crdb_internal.revlog_synth_coverage(collection: string, effective_from: timestamptz, table_id: int) -> bool`,
 }
 
 var builtinOidsBySignature map[string]oid.Oid

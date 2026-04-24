@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/resolvedspan"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/schemafeed"
 	"github.com/cockroachdb/cockroach/pkg/changefeed/changefeedpb"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobfrontier"
@@ -30,7 +31,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
+	"github.com/cockroachdb/cockroach/pkg/revlog"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -479,10 +482,21 @@ func (ca *changeAggregator) startKVFeed(
 			&ca.metrics.KVFeedMetrics.AggregatorBufferMetrics, options...),
 		cdcutils.NodeLevelThrottler(&cfg.Settings.SV, &ca.metrics.ThrottleMetrics))
 
+	// If a revision-stream URI is configured, open external storage and
+	// build a LogReader
+	revStreamReader, closeRevStream, err := openRevisionStream(
+		ctx, ca.FlowCtx.Cfg.Settings, ca.FlowCtx.Cfg.ExternalStorageFromURI)
+	if err != nil {
+		log.Changefeed.Warningf(ctx,
+			"revision stream unavailable, falling back to KV catch-up: %v", err)
+		revStreamReader = nil
+	}
+
 	// KVFeed takes ownership of the kvevent.Writer portion of the buffer, while
 	// we return the kvevent.Reader part to the caller.
-	kvfeedCfg, err := ca.makeKVFeedCfg(ctx, config, spans, buf, initialHighWater, needsInitialScan, kvFeedMemMon, opts)
+	kvfeedCfg, err := ca.makeKVFeedCfg(ctx, config, spans, buf, initialHighWater, needsInitialScan, kvFeedMemMon, opts, revStreamReader)
 	if err != nil {
+		closeRevStream()
 		return nil, nil, nil, err
 	}
 
@@ -493,14 +507,36 @@ func (ca *changeAggregator) startKVFeed(
 	if err := ca.FlowCtx.Stopper().RunAsyncTask(ctx, "changefeed-poller", func(ctx context.Context) {
 		defer close(doneCh)
 		defer kvFeedMemMon.Stop(ctx)
+		defer closeRevStream()
 		errCh <- kvfeed.Run(ctx, kvfeedCfg)
 	}); err != nil {
-		// Ensure that the memory monitor is closed properly.
+		// Ensure that the memory monitor and revision-stream handle are closed properly.
 		kvFeedMemMon.Stop(ctx)
+		closeRevStream()
 		return nil, nil, nil, err
 	}
 
 	return buf, doneCh, errCh, nil
+}
+
+// openRevisionStream resolves the changefeed.revision_stream.uri cluster
+// setting and, if non-empty, opens the corresponding external storage and
+// constructs a LogReader. The returned closer must always be called
+// (it's a no-op when there's nothing to close).
+func openRevisionStream(
+	ctx context.Context,
+	settings *cluster.Settings,
+	storageFromURI cloud.ExternalStorageFromURIFactory,
+) (revlog.LogReader, func(), error) {
+	uri := changefeedbase.RevisionStreamURI.Get(&settings.SV)
+	if uri == "" {
+		return nil, func() {}, nil
+	}
+	es, err := storageFromURI(ctx, uri, username.RootUserName())
+	if err != nil {
+		return nil, func() {}, errors.Wrapf(err, "opening revision stream at %s", uri)
+	}
+	return revlog.NewLogReaderImpl(es), func() { _ = es.Close() }, nil
 }
 
 func (ca *changeAggregator) checkKVFeedErr() error {
@@ -521,6 +557,7 @@ func (ca *changeAggregator) makeKVFeedCfg(
 	needsInitialScan bool,
 	memMon *mon.BytesMonitor,
 	opts changefeedbase.StatementOptions,
+	revStreamReader revlog.LogReader,
 ) (kvfeed.Config, error) {
 	schemaChange, err := config.Opts.GetSchemaChangeHandlingOptions()
 	if err != nil {
@@ -585,6 +622,7 @@ func (ca *changeAggregator) makeKVFeedCfg(
 		ScopedTimers:         ca.sliMetrics.Timers,
 		MonitoringCfg:        monitoringCfg,
 		ConsumerID:           int64(ca.spec.JobID),
+		RevisionStreamReader: revStreamReader,
 	}, nil
 }
 
