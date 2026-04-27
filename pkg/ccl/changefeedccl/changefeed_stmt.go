@@ -2106,9 +2106,15 @@ func (b *changefeedResumer) OnFailOrCancel(
 			ptsID,
 		)
 	}
-	// Not sure this is the write place to clean up the cluster metric
-	jobIDStr := strconv.FormatInt(int64(b.job.ID()), 10)
-	clusterCheckpointLag.Delete(map[string]string{"job_id": jobIDStr})
+	// Drop the per-job entry from the cluster checkpoint-lag stopwatch.
+	// OnFailOrCancel runs on the resumer (coordinator) node, which may
+	// differ from the node that registered the entry via SetStartTime;
+	// Delete only affects the local writer's tracked vec, so stale
+	// entries on other nodes will eventually be reclaimed by the cmreader
+	// pipeline.
+	clusterCheckpointLag.Delete(map[string]string{
+		"job_id": strconv.FormatInt(int64(b.job.ID()), 10),
+	})
 
 	maybeCleanUpProtectedTimestamp(progress.GetChangefeed().ProtectedTimestampRecord)
 	// We clean up the per-table protected timestamps (and their accompanying

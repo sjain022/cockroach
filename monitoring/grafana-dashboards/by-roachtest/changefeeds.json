@@ -567,7 +567,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "exemplar": true,
-          "expr": "time() * 1e9 - changefeed_checkpoint_lag{job=\"cockroachdb\",test_run_id=~\"$test_run_id\", test_name=~\"$test_name\",instance=~\"$node\"}",
+          "expr": "changefeed_checkpoint_lag{job=\"cockroachdb\",test_run_id=~\"$test_run_id\", test_name=~\"$test_name\",instance=~\"$node\"}",
           "interval": "",
           "legendFormat": "job_id={{job_id}}",
           "refId": "A"

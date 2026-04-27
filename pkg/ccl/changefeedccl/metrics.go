@@ -872,14 +872,39 @@ var (
 		Unit:        metric.Unit_COUNT,
 		Category:    metric.Metadata_CHANGEFEEDS,
 	}
-	// probably fine to keep this here for now .
-	metaCheckPointLagMetric = metric.Metadata{
+	// metaCheckpointLag is a cluster-scoped per-job metric reported as
+	// elapsed nanoseconds. The write path stores newResolved.WallTime
+	// (the resolved frontier nanos) as the stopwatch's "start time";
+	// the cmreader exports STOPWATCH-typed metrics through
+	// timeElapsedSince so Prometheus sees `now - newResolved.WallTime`
+	// — i.e. how far behind real time the durably persisted frontier is.
+	// Dashboards reference this metric directly without further math.
+	//
+	// Distinct from changefeed.checkpoint_progress, which exposes the
+	// same quantity but aggregated by min across all jobs in a metric
+	// scope; this metric is per-job.
+	metaCheckpointLag = metric.Metadata{
 		Name:        "changefeed.checkpoint_lag",
-		Help:        "Elapsed time sine the last persisted checkpoint, per changefeed job",
+		Help:        "Elapsed nanoseconds between now and the resolved frontier of the most recent persisted checkpoint, per changefeed job.",
 		Measurement: "Nanoseconds",
 		Unit:        metric.Unit_NANOSECONDS,
 		Category:    metric.Metadata_CHANGEFEEDS,
 	}
+)
+
+// clusterCheckpointLag is a per-job cluster metric whose stored value
+// is newResolved.WallTime (the resolved frontier of the most recently
+// persisted checkpoint). The metric is registered as STOPWATCH so the
+// cmreader applies timeElapsedSince at scrape time, exporting "now -
+// stored" as the Prometheus value — i.e. checkpoint lag in ns.
+//
+// We bypass SetStartTime (which would store wallclock-now) and write
+// to the embedded GaugeVec directly so the stopwatch's reference point
+// is the data timestamp rather than the wallclock time of the
+// persistence event. AddMetric is called from changeFrontier.Start;
+// Delete is called from changefeedResumer.OnFailOrCancel.
+var clusterCheckpointLag = cmmetrics.NewWriteStopwatchVec(
+	metaCheckpointLag, timeutil.DefaultTimeSource{}, "job_id",
 )
 
 func newAggregateMetrics(histogramWindow time.Duration, lookup *cidr.Lookup) *AggMetrics {
@@ -1507,26 +1532,6 @@ type Metrics struct {
 	}
 }
 
-// Cluter metrics are the new metrics introduced for cluster wide
-type ClusterMetrics struct {
-	myClusterCheckpointLag *cmmetrics.WriteStopwatchVec
-}
-
-func (*ClusterMetrics) MetricStruct() {}
-
-var clusterCheckpointLag = cmmetrics.NewWriteStopwatchVec(
-	metaCheckPointLagMetric, timeutil.DefaultTimeSource{}, "job_id",
-)
-
-// The writer is interface that exists in the exec.Cfg I can not really use this
-// func NewClusterMetrics(writer *cmwriter.Writer) metric.Struct {
-// 	ret := &ClusterMetrics{
-// 		myClusterCheckpointLag: clustermetrics.NewWriteStopwatchVec(metaCheckPointLagMetric, timeutil.DefaultTimeSource{}, "job_id"),
-// 	}
-// 	writer.AddMetricStruct(ret)
-// 	return ret
-// }
-
 // MetricStruct implements the metric.Struct interface.
 func (*Metrics) MetricStruct() {}
 
@@ -1614,6 +1619,4 @@ func MakeMemoryMetrics(
 func init() {
 	jobs.MakeChangefeedMetricsHook = MakeMetrics
 	jobs.MakeChangefeedMemoryMetricsHook = MakeMemoryMetrics
-	//apparently not needed ? I need to read more on this later
-	// clustermetrics.RegisterClusterMetric(metaCheckPointLagMetric.Name, metaCheckPointLagMetric)
 }

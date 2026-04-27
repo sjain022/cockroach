@@ -1333,11 +1333,13 @@ func (cf *changeFrontier) Start(ctx context.Context) {
 	// TODO(yevgeniy): Figure out how to inject replication stream metrics.
 	cf.metrics = cf.FlowCtx.Cfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics)
 
-	// Cluster level metric
+	// Register the cluster-scoped checkpoint-lag stopwatch with the
+	// local writer. AddMetric is idempotent (it overwrites by name),
+	// so calling it on every changeFrontier start is safe. The writer
+	// can be nil in test setups that bypass the SQL server.
 	execCfg := cf.FlowCtx.Cfg.ExecutorConfig.(*sql.ExecutorConfig)
 	if execCfg.ClusterMetricsWriter != nil {
 		execCfg.ClusterMetricsWriter.AddMetric(clusterCheckpointLag)
-
 	}
 
 	// Pass a nil oracle because this sink is only used to emit resolved timestamps
@@ -1749,8 +1751,14 @@ func (cf *changeFrontier) maybeCheckpoint(
 	// checkpoint_progress metric which will return the lowest timestamp across
 	// all feeds in the scope.
 	cf.sliMetrics.setCheckpoint(cf.sliMetricsID, newResolved)
-	jobIDStr := strconv.FormatInt(int64(cf.spec.JobID), 10)
-	clusterCheckpointLag.SetStartTime(map[string]string{"job_id": jobIDStr})
+	// Store the resolved frontier as the stopwatch's "start time" by
+	// reaching past SetStartTime (which would record wallclock-now)
+	// into the embedded GaugeVe. The cmreader's STOPWATCH derivation
+	// will expose this as `now - newResolved.WallTime` to Prometheus —
+	// the per-job checkpoint lag in nanoseconds.
+	clusterCheckpointLag.GaugeVec.Update(map[string]string{
+		"job_id": strconv.FormatInt(int64(cf.spec.JobID), 10),
+	}, newResolved.WallTime)
 
 	return cf.maybeEmitResolved(ctx, newResolved)
 }
