@@ -891,7 +891,7 @@ func (*ClusterMetrics) MetricStruct() {}
 // changefeed package. New cluster metrics should be added by extending
 // this struct.
 type ClusterMetrics struct {
-	CheckpointLag *cmmetrics.GaugeVec
+	CheckpointLag *cmmetrics.WriteStopwatchVec
 }
 
 // RegisterWith attaches all cluster metrics to the given writer.
@@ -905,7 +905,7 @@ func (cm *ClusterMetrics) RegisterClusterMetric(writer sql.ClusterMetricAdder) {
 // SetCheckpointLag records the resolved-frontier nanos of the most
 // recent persisted checkpoint for the given job.
 func (cm *ClusterMetrics) SetCheckpointLag(jobID jobspb.JobID, frontierNanos int64) {
-	cm.CheckpointLag.Update(jobIDLabels(jobID), frontierNanos)
+	cm.CheckpointLag.GaugeVec.Update(jobIDLabels(jobID), frontierNanos)
 }
 
 // DeleteJob drops all cluster metric entries belonging to the given
@@ -1588,7 +1588,7 @@ func MakeMetrics(histogramWindow time.Duration, lookup *cidr.Lookup) metric.Stru
 		}),
 		ParallelConsumerInFlightEvents: metric.NewGauge(metaChangefeedEventConsumerInFlightEvents),
 		ClusterMetrics: &ClusterMetrics{
-			CheckpointLag: cmmetrics.NewGaugeVec(metaCheckpointLag, "job_id"),
+			CheckpointLag: cmmetrics.NewWriteStopwatchVec(metaCheckpointLag, timeutil.DefaultTimeSource{}, "job_id"),
 		},
 	}
 

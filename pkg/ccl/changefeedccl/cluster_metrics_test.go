@@ -12,6 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/obs/clustermetrics/cmmetrics"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -28,7 +29,7 @@ func TestClusterMetricsCheckpointLag_SetAndDelete(t *testing.T) {
 	defer cmmetrics.TestingAllowNonInitConstruction()()
 
 	cm := &ClusterMetrics{
-		CheckpointLag: cmmetrics.NewGaugeVec(metaCheckpointLag, "job_id"),
+		CheckpointLag: cmmetrics.NewWriteStopwatchVec(metaCheckpointLag, timeutil.DefaultTimeSource{}, "job_id"),
 	}
 
 	// childValue returns the stored value for the given job_id, or -1

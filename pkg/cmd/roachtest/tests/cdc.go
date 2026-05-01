@@ -3369,6 +3369,98 @@ CONFIGURE ZONE USING
 		},
 	})
 	r.Add(registry.TestSpec{
+		// cdc/checkpoint-lag-demo is a manual-only test for visually
+		// inspecting the per-job changefeed.checkpoint_lag cluster metric in
+		// Grafana. It runs three concurrent changefeeds with distinct
+		// metrics_label scopes so the user can correlate each `job_id` series
+		// in Prometheus, then walks through pause / resume / cancel to
+		// demonstrate how the metric reacts to each lifecycle transition.
+		//
+		// Expected Grafana behavior over the demo timeline:
+		//  - Phase 1 (5m): three series at low, steady lag (~pipeline lag).
+		//  - Phase 2 (5m): feed-a paused -> its series ramps linearly while
+		//    feed-b and feed-c stay flat.
+		//  - Phase 3 (3m): feed-a resumed -> its series drops back near the
+		//    others on the next checkpoint.
+		//  - Phase 4 (2m): all three canceled -> series disappear from the
+		//    panel within ~10s (one cluster-metrics flush cycle).
+		Name:             "cdc/checkpoint-lag-demo",
+		Owner:            registry.OwnerCDC,
+		Cluster:          r.MakeClusterSpec(4, spec.WorkloadNode(), spec.CPU(8)),
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.ManualOnly,
+		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			ct := newCDCTester(ctx, t, c)
+			defer ct.Close()
+
+			// Run TPCC for the full demo duration so each feed has continuous
+			// data to keep its frontier advancing while running.
+			ct.runTPCCWorkload(tpccArgs{
+				warehouses: 100,
+				duration:   "30m",
+			})
+
+			// Each feed targets a disjoint subset of TPCC tables and uses a
+			// distinct metrics_label so per-feed series are easy to tell apart
+			// in Grafana (the label propagates as the `scope` label on
+			// changefeed.* metrics, and the per-job clusterCheckpointLag
+			// series carries `job_id` natively).
+			feedSpecs := []struct {
+				label   string
+				targets []string
+			}{
+				{"feed-a", []string{`tpcc.warehouse`, `tpcc.district`, `tpcc.customer`}},
+				{"feed-b", []string{`tpcc.history`, `tpcc.order`, `tpcc.new_order`}},
+				{"feed-c", []string{`tpcc.item`, `tpcc.stock`, `tpcc.order_line`}},
+			}
+			feeds := make([]changefeedJob, len(feedSpecs))
+			for i, fs := range feedSpecs {
+				feeds[i] = ct.newChangefeed(feedArgs{
+					sinkType: nullSink,
+					targets:  fs.targets,
+					opts: map[string]string{
+						"metrics_label": fmt.Sprintf("'%s'", fs.label),
+					},
+				})
+				t.Status(fmt.Sprintf("created %s with job_id=%d", fs.label, feeds[i].jobID))
+			}
+
+			db := ct.DB()
+			sleep := func(d time.Duration, msg string) {
+				t.Status(fmt.Sprintf("%s (sleeping %s)", msg, d))
+				select {
+				case <-ctx.Done():
+				case <-time.After(d):
+				}
+			}
+			runJobCmd := func(stmt, label string, jobID int) {
+				if _, err := db.ExecContext(ctx, fmt.Sprintf("%s JOB %d", stmt, jobID)); err != nil {
+					t.Fatalf("%s %s (job_id=%d): %v", stmt, label, jobID, err)
+				}
+				t.Status(fmt.Sprintf("%s issued for %s (job_id=%d)", stmt, label, jobID))
+			}
+
+			sleep(5*time.Minute,
+				"Phase 1: three feeds running. Watch changefeed_checkpoint_lag — expect three series at low, steady lag.")
+
+			runJobCmd("PAUSE", feedSpecs[0].label, feeds[0].jobID)
+			sleep(5*time.Minute, fmt.Sprintf(
+				"Phase 2: %s paused. Its series should ramp linearly while %s and %s stay flat.",
+				feedSpecs[0].label, feedSpecs[1].label, feedSpecs[2].label))
+
+			runJobCmd("RESUME", feedSpecs[0].label, feeds[0].jobID)
+			sleep(3*time.Minute, fmt.Sprintf(
+				"Phase 3: %s resumed. Its series should drop back near the others on the next checkpoint.",
+				feedSpecs[0].label))
+
+			for i, fs := range feedSpecs {
+				runJobCmd("CANCEL", fs.label, feeds[i].jobID)
+			}
+			sleep(2*time.Minute,
+				"Phase 4: all three canceled. Watch the series disappear from the panel within ~10s.")
+		},
+	})
+	r.Add(registry.TestSpec{
 		Name:             "cdc/multiple-schema-changes",
 		Owner:            registry.OwnerCDC,
 		Benchmark:        false,
