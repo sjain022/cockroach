@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -742,4 +743,90 @@ func TestShowChangefeedJobsDefaultFilter(t *testing.T) {
 	}
 
 	cdcTest(t, testFn, feedTestForceSink("kafka"), updateKnobs)
+}
+
+// TestShowChangefeedJobsTopicsAfterAlterExternalConnection verifies that the
+// `topics` column of SHOW CHANGEFEED JOBS reflects the topic the changefeed
+// is currently emitting to after the underlying external connection has been
+// re-pointed via ALTER EXTERNAL CONNECTION. Two paths are exercised:
+//
+//   - pause / alter / resume: refreshed at the start of each resume cycle.
+//   - alter while running:    refreshed by the destination-change poller.
+func TestShowChangefeedJobsTopicsAfterAlterExternalConnection(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	for _, tc := range []struct {
+		name         string
+		triggerAlter func(t *testing.T, sqlDB *sqlutils.SQLRunner, jobID jobspb.JobID, alterStmt string)
+	}{
+		{
+			name: "pause-resume",
+			triggerAlter: func(t *testing.T, sqlDB *sqlutils.SQLRunner, jobID jobspb.JobID, alterStmt string) {
+				sqlDB.Exec(t, fmt.Sprintf(`PAUSE JOB %d`, jobID))
+				waitForJobState(sqlDB, t, jobID, jobs.StatePaused)
+				sqlDB.Exec(t, alterStmt)
+				sqlDB.Exec(t, fmt.Sprintf(`RESUME JOB %d`, jobID))
+				waitForJobState(sqlDB, t, jobID, jobs.StateRunning)
+			},
+		},
+		{
+			name: "alter-while-running",
+			triggerAlter: func(t *testing.T, sqlDB *sqlutils.SQLRunner, jobID jobspb.JobID, alterStmt string) {
+				sqlDB.Exec(t, alterStmt)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, stopServer := makeServer(t)
+			defer stopServer()
+
+			knobs := s.TestingKnobs.
+				DistSQL.(*execinfra.TestingKnobs).
+				Changefeed.(*TestingKnobs)
+			knobs.WrapSink = func(s Sink, _ jobspb.JobID) Sink {
+				// External connections recursively invoke `getSink` for the
+				// underlying resource, so guard against double-wrapping.
+				if _, ok := s.(*externalConnectionKafkaSink); ok {
+					return s
+				}
+				return &externalConnectionKafkaSink{sink: s, ignoreDialError: true}
+			}
+			// Shrink the destination-change poll interval so the
+			// alter-while-running case observes the change quickly.
+			knobs.DestinationCheckInterval = 100 * time.Millisecond
+
+			sqlDB := sqlutils.MakeSQLRunner(s.DB)
+			sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY)`)
+			sqlDB.Exec(t,
+				`CREATE EXTERNAL CONNECTION my_conn AS 'kafka://nope/?topic_name=topic_a'`)
+
+			var jobID jobspb.JobID
+			sqlDB.QueryRow(t,
+				`CREATE CHANGEFEED FOR foo INTO 'external://my_conn'`).Scan(&jobID)
+			waitForJobState(sqlDB, t, jobID, jobs.StateRunning)
+
+			readTopics := func() string {
+				var topics gosql.NullString
+				sqlDB.QueryRow(t,
+					`SELECT topics FROM [SHOW CHANGEFEED JOBS] WHERE job_id = $1`, jobID,
+				).Scan(&topics)
+				return topics.String
+			}
+
+			require.Equal(t, "topic_a", readTopics())
+
+			tc.triggerAlter(t, sqlDB, jobID,
+				`ALTER EXTERNAL CONNECTION my_conn AS 'kafka://nope/?topic_name=topic_b'`)
+
+			// The refresh is asynchronous in both cases, so poll.
+			testutils.SucceedsSoon(t, func() error {
+				got := readTopics()
+				if got != "topic_b" {
+					return errors.Errorf("expected topic_b, got %q", got)
+				}
+				return nil
+			})
+		})
+	}
 }

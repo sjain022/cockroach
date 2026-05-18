@@ -92,7 +92,19 @@ func (e *externalConnectionKafkaSink) EmitResolvedTimestamp(
 	return nil
 }
 
+// Topics implements the SinkWithTopics interface by delegating to the
+// underlying sink. Tests that observe SHOW CHANGEFEED JOBS' topics column
+// rely on this passthrough; without it the canary-sink path skips the
+// SinkWithTopics branch and never populates details.Opts["topics"].
+func (e *externalConnectionKafkaSink) Topics() []string {
+	if t, ok := e.sink.(SinkWithTopics); ok {
+		return t.Topics()
+	}
+	return nil
+}
+
 var _ Sink = (*externalConnectionKafkaSink)(nil)
+var _ SinkWithTopics = (*externalConnectionKafkaSink)(nil)
 
 func TestChangefeedExternalConnections(t *testing.T) {
 	defer leaktest.AfterTest(t)()

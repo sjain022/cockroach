@@ -7,6 +7,7 @@ package changefeedccl
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
@@ -141,6 +142,11 @@ type TestingKnobs struct {
 	// changefeeds, it is nil. A non-nil return error is propagated to
 	// the change frontier.
 	AfterPersistFrontier func(eval.CoreChangefeedState) error
+
+	// DestinationCheckInterval overrides the polling interval used by the
+	// resumer to detect changes to the resolved sink destination (e.g. when
+	// an external connection is altered). Zero means use the default.
+	DestinationCheckInterval time.Duration
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

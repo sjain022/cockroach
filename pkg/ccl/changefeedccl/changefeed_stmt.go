@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/backup/backupresolver"
@@ -63,6 +64,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -1823,6 +1825,18 @@ func (b *changefeedResumer) resumeWithRetries(
 		log.Changefeed.Warningf(ctx, "failed to resolve destination details for change monitoring: %v", err)
 	}
 
+	// Refresh details.Opts["topics"] in the persisted payload so that
+	// SHOW CHANGEFEED JOBS reflects the topic the changefeed is actually
+	// emitting to. This handles the pause/resume flow after an
+	// ALTER EXTERNAL CONNECTION; the live-alter flow is handled in the
+	// destination-change polling goroutine below. A failure here is
+	// non-fatal — it only affects the SHOW display, not emission.
+	if newDetails, refreshErr := refreshChangefeedTopics(ctx, jobExec, b.job, details); refreshErr != nil {
+		log.Changefeed.Warningf(ctx, "failed to refresh changefeed topics for SHOW CHANGEFEED JOBS: %v", refreshErr)
+	} else {
+		details = newDetails
+	}
+
 	onTracingEvent := func(ctx context.Context, meta *execinfrapb.TracingAggregatorEvents) {
 		componentID := execinfrapb.ComponentID{
 			FlowID:        meta.FlowID,
@@ -1959,7 +1973,11 @@ func (b *changefeedResumer) resumeWithRetries(
 
 			// Poll for updated configuration or new database tables if hibernating.
 			g.GoCtx(func(ctx context.Context) error {
-				t := time.NewTicker(15 * time.Second)
+				interval := 15 * time.Second
+				if knobs != nil && knobs.DestinationCheckInterval > 0 {
+					interval = knobs.DestinationCheckInterval
+				}
+				t := time.NewTicker(interval)
 				defer t.Stop()
 				for {
 					select {
@@ -1973,6 +1991,13 @@ func (b *changefeedResumer) resumeWithRetries(
 							log.Changefeed.Warningf(ctx, "failed to check for updated configuration: %v", err)
 						} else if newDest != resolvedDest {
 							resolvedDest = newDest
+							// Refresh the persisted topics so SHOW CHANGEFEED JOBS reflects
+							// the new destination even if no pause/resume happens.
+							if newDetails, refreshErr := refreshChangefeedTopics(ctx, jobExec, b.job, details); refreshErr != nil {
+								log.Changefeed.Warningf(ctx, "failed to refresh changefeed topics for SHOW CHANGEFEED JOBS: %v", refreshErr)
+							} else {
+								details = newDetails
+							}
 							return replanErr
 						}
 					}
@@ -2049,6 +2074,108 @@ func (b *changefeedResumer) resumeWithRetries(
 	}
 
 	return errors.Wrap(ctx.Err(), `ran out of retries`)
+}
+
+// refreshChangefeedTopics rebuilds a canary sink for the changefeed's
+// (possibly re-resolved) sink URI and persists details.Opts["topics"] in
+// the job payload to match what the sink will actually emit to. This keeps
+// the SHOW CHANGEFEED JOBS topics column accurate after the underlying
+// external connection has been re-pointed via ALTER EXTERNAL CONNECTION.
+//
+// The original value is written once at CREATE CHANGEFEED time by
+// validateSink and is not otherwise refreshed; without this call the
+// displayed value drifts from reality even though the changefeed has
+// already begun emitting to the new topic.
+//
+// Returns the (possibly updated) details so callers can keep their
+// in-memory copy in sync. Sinks that don't implement SinkWithTopics
+// (cloudstorage, webhook, etc.) are no-ops.
+func refreshChangefeedTopics(
+	ctx context.Context,
+	jobExec sql.JobExecContext,
+	job *jobs.Job,
+	details jobspb.ChangefeedDetails,
+) (jobspb.ChangefeedDetails, error) {
+	execCfg := jobExec.ExecCfg()
+	jobID := job.ID()
+
+	// details.StatementTime is sufficient for descriptor lookups here: we only
+	// need the targets to construct the TopicNamer, and the table identities
+	// are stable across the schema-version range a running changefeed cares
+	// about.
+	targets, err := AllTargets(ctx, details, execCfg, details.StatementTime)
+	if err != nil {
+		return details, err
+	}
+
+	metrics, ok := execCfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics)
+	if !ok {
+		return details, errors.AssertionFailedf("changefeed metrics missing from registry")
+	}
+	sli, err := metrics.getSLIMetrics(details.Opts[changefeedbase.OptMetricsScope])
+	if err != nil {
+		return details, err
+	}
+
+	var nilOracle timestampLowerBoundOracle
+	canarySink, err := getAndDialSink(ctx, &execCfg.DistSQLSrv.ServerConfig, details,
+		nilOracle, jobExec.User(), jobID, sli, targets, true /* initialValidation */)
+	if err != nil {
+		return details, err
+	}
+	defer func() { _ = canarySink.Close() }()
+
+	sinkWithTopics, ok := canarySink.(SinkWithTopics)
+	if !ok {
+		return details, nil
+	}
+
+	newTopics := strings.Join(sinkWithTopics.Topics(), ",")
+	if newTopics == details.Opts[changefeedbase.Topics] {
+		return details, nil
+	}
+
+	// Persist the refreshed topics via the InfoStorage API
+	// (pkg/jobs/job_info_storage.go). The payload protobuf is the unit of
+	// storage in system.job_info under LegacyPayloadKey; load, mutate, then
+	// write back in a single transaction.
+	const opName = "changefeed-refresh-topics"
+	if err := execCfg.InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		info := job.InfoStorage(txn)
+		payloadBytes, exists, err := info.GetLegacyPayload(ctx, opName)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return errors.AssertionFailedf("job %d payload not found in system.job_info", jobID)
+		}
+		var payload jobspb.Payload
+		if err := protoutil.Unmarshal(payloadBytes, &payload); err != nil {
+			return err
+		}
+		cfDetails, ok := payload.UnwrapDetails().(jobspb.ChangefeedDetails)
+		if !ok {
+			return errors.AssertionFailedf("expected ChangefeedDetails, got %T", payload.UnwrapDetails())
+		}
+		if cfDetails.Opts == nil {
+			cfDetails.Opts = map[string]string{}
+		}
+		cfDetails.Opts[changefeedbase.Topics] = newTopics
+		payload.Details = jobspb.WrapPayloadDetails(cfDetails)
+		newBytes, err := protoutil.Marshal(&payload)
+		if err != nil {
+			return err
+		}
+		return info.WriteLegacyPayload(ctx, newBytes)
+	}); err != nil {
+		return details, err
+	}
+
+	if details.Opts == nil {
+		details.Opts = map[string]string{}
+	}
+	details.Opts[changefeedbase.Topics] = newTopics
+	return details, nil
 }
 
 func resolveDest(ctx context.Context, execCfg *sql.ExecutorConfig, sinkURI string) (string, error) {
